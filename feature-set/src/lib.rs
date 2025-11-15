@@ -174,6 +174,12 @@ impl FeatureSet {
             fix_alt_bn128_pairing_length_check: self
                 .is_active(&fix_alt_bn128_pairing_length_check::id()),
             alt_bn128_little_endian: self.is_active(&alt_bn128_little_endian::id()),
+            multisig_feature_gate_activation_test_1: self
+                .is_active(&multisig_feature_gate_activation_test_1::id()),
+            multisig_feature_gate_activation_test_2: self
+                .is_active(&multisig_feature_gate_activation_test_2::id()),
+            multisig_feature_gate_activation_test_3: self
+                .is_active(&multisig_feature_gate_activation_test_3::id()),
         }
     }
 }
@@ -1204,6 +1210,18 @@ pub mod alt_bn128_little_endian {
     solana_pubkey::declare_id!("bnS3pWfLrxHRJvMyLm6EaYQkP7A2Fe9DxoKv4aGA8YM");
 }
 
+pub mod multisig_feature_gate_activation_test_1 {
+    solana_pubkey::declare_id!("5FXx4HHuAtkaf5Bbn82pQ5qAgoGymvLuN2Dd3v1Vd9ZM");
+}
+
+pub mod multisig_feature_gate_activation_test_2 {
+    solana_pubkey::declare_id!("FsGoA3iNJBmETCmkEe9j4aTAs2uvXw6BjAhFMwByjRQR");
+}
+
+pub mod multisig_feature_gate_activation_test_3 {
+    solana_pubkey::declare_id!("G42STJjumaL17Z8igcLNhgmCpgzvhdZvWDxBwQ7GFjYs");
+}
+
 pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::new(|| {
     [
         (secp256k1_program_enabled::id(), "secp256k1 program"),
@@ -2158,6 +2176,18 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
         (
             alt_bn128_little_endian::id(),
             "SIMD-0284: Add little-endian compatibility for alt_bn128",
+        ),
+        (
+            multisig_feature_gate_activation_test_1::id(),
+            "Testing activating feature gate with multisig normal flow",
+        ),
+        (
+            multisig_feature_gate_activation_test_2::id(),
+            "Testing activating feature gate with multisig normal flow then revoke",
+        ),
+        (
+            multisig_feature_gate_activation_test_3::id(),
+            "Testing activating feature gate with multisig normal flow never triggered",
         ),
         /*************** ADD NEW FEATURES HERE ***************/
     ]
