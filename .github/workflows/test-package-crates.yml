@@ -1,0 +1,74 @@
+name: TEST package crates (temporary — delete before merge)
+
+# Validates the `Package crates` change from publish-crates.yml on a fork, without publishing.
+# The real workflow's package job is gated on `github.repository == 'anza-xyz/agave'` and a tag;
+# this strips those so it runs on a fork branch via manual dispatch. No attest, no publish.
+
+on:
+  workflow_dispatch:
+    inputs:
+      verify:
+        description: Compile each crate (cargo package WITH verify). Slow, but catches isolation build failures.
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Resolve Docker image
+        id: docker
+        shell: bash
+        run: |
+          set -euo pipefail
+          source ci/docker/env.sh
+          echo "image=${CI_DOCKER_IMAGE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Compute publish layers
+        id: layers
+        env:
+          DOCKER_IMAGE: ${{ steps.docker.outputs.image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          raw=$(docker run --rm \
+            -v "${PWD}:/solana" -w /solana \
+            "${DOCKER_IMAGE}" \
+            cargo xtask publish order --format json)
+          layers=$(jq -c 'map(map({name}))' <<<"${raw}")
+          echo "layers=${layers}" >> "${GITHUB_OUTPUT}"
+
+      - name: Package crates
+        env:
+          DOCKER_IMAGE: ${{ steps.docker.outputs.image }}
+          LAYERS: ${{ steps.layers.outputs.layers }}
+          VERIFY: ${{ inputs.verify }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/crate-staging
+          extra=()
+          [[ "${VERIFY}" == "true" ]] || extra=(--no-verify)
+          jq -r '.[][].name | "-p", .' <<<"${LAYERS}" \
+            | xargs -r docker run --rm \
+              -v "${PWD}:/solana" -w /solana \
+              "${DOCKER_IMAGE}" \
+              cargo package "${extra[@]}"
+          cp -v target/package/*.crate target/crate-staging/
+
+      - name: Upload crate artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: crate-files
+          path: target/crate-staging/*.crate
+          if-no-files-found: error
+          retention-days: 7
