@@ -6,11 +6,6 @@ name: TEST package crates (temporary — delete before merge)
 
 on:
   workflow_dispatch:
-    inputs:
-      verify:
-        description: Compile each crate (cargo package WITH verify). Slow, but catches isolation build failures.
-        type: boolean
-        default: false
 
 permissions: {}
 
@@ -51,18 +46,15 @@ jobs:
         env:
           DOCKER_IMAGE: ${{ steps.docker.outputs.image }}
           LAYERS: ${{ steps.layers.outputs.layers }}
-          VERIFY: ${{ inputs.verify }}
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p target/crate-staging
-          extra=()
-          [[ "${VERIFY}" == "true" ]] || extra=(--no-verify)
           jq -r '.[][].name | "-p", .' <<<"${LAYERS}" \
             | xargs -r docker run --rm \
               -v "${PWD}:/solana" -w /solana \
               "${DOCKER_IMAGE}" \
-              cargo package "${extra[@]}"
+              cargo package --no-verify
           cp -v target/package/*.crate target/crate-staging/
 
       - name: Upload crate artifacts
