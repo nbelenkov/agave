@@ -29,24 +29,26 @@ jobs:
     runs-on: ubuntu-latest # amd64 == the fleet's architecture
     environment: fuzz
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Toolchain
         run: |
           set -euo pipefail
-          rustup toolchain install nightly --component rust-src llvm-tools-preview
+          # --component takes a COMMA-SEPARATED list. Space-separated, rustup reads the second
+          # value as a toolchain name and fails with "invalid toolchain name".
+          rustup toolchain install nightly --component rust-src,llvm-tools-preview
           cargo install cargo-fuzz --locked
 
       - id: auth
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ vars.WIF_PROVIDER }}
           service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
 
       # Needed for `gcloud auth configure-docker` below; the auth step above only writes ADC.
-      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
 
       # fuzzctl comes from the platform's tooling registry, not `go install`: the platform repo is
       # private, so a harness repo cannot resolve the module. The image is distroless and the binary
