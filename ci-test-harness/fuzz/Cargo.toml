@@ -1,0 +1,22 @@
+[package]
+name = "ci-test-harness-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+ci-test-harness = { path = ".." }
+
+[[bin]]
+name = "ci-test"
+path = "fuzz_targets/ci_test.rs"
+test = false
+doc = false
+bench = false
+
+# Keep this fuzz crate out of the parent workspace resolution; it is built with cargo-fuzz.
+[workspace]

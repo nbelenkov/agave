@@ -1,0 +1,117 @@
+# Platform CI-submission test. Same path a real harness repo uses (design 4/14): build the target,
+# assemble a bundle with fuzzctl, authenticate to GCP with GitHub OIDC -> Workload Identity
+# Federation (no stored key), and publish straight to the build bucket. The platform's controller
+# then onboards the target and the fleet fuzzes it.
+#
+# This exists to exercise the pipeline, not to find bugs. It writes the target `ci-test` ONLY: this
+# repo's uploader credentials are scoped to that name, so it cannot flip a real target's `_latest`
+# pointer and roll the live fleet onto a test build.
+#
+# Requires a repository environment named `fuzz` (Settings -> Environments) with four environment
+# VARIABLES (not secrets -- none of these are credentials; see the note at the bottom of this file):
+#   WIF_PROVIDER            projects/<num>/locations/global/workloadIdentityPools/fuzz-github/providers/github
+#   WIF_SERVICE_ACCOUNT     fuzz-up-<repo-slug>@<project>.iam.gserviceaccount.com
+#   FUZZCTL_IMAGE           <region>-docker.pkg.dev/<project>/fuzzplat-tools/fuzzctl:<pinned tag>
+#   FUZZPLAT_BUCKET_PREFIX  the platform's bucket prefix (e.g. fuzzplat-test)
+name: Fuzz CI submission test
+
+on:
+  push:
+    branches: [fuzz-ci-test]
+  workflow_dispatch: # so the flow can be re-run without a new commit
+
+permissions:
+  contents: read
+  id-token: write # required for GitHub OIDC -> WIF
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest # amd64 == the fleet's architecture
+    environment: fuzz
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly --component rust-src llvm-tools-preview
+          cargo install cargo-fuzz --locked
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
+
+      # Needed for `gcloud auth configure-docker` below; the auth step above only writes ADC.
+      - uses: google-github-actions/setup-gcloud@v2
+
+      # fuzzctl comes from the platform's tooling registry, not `go install`: the platform repo is
+      # private, so a harness repo cannot resolve the module. The image is distroless and the binary
+      # is static, so it is copied out and run directly — no volume mounts, no credentials passed
+      # into a container. The registry holds only fuzzctl; reader on the platform's own registry
+      # would also expose the runner, ingest and upload images.
+      - name: Install fuzzctl
+        env:
+          # Pin the tag. A moving tag means a build's behaviour changes without its commit changing.
+          FUZZCTL_IMAGE: ${{ vars.FUZZCTL_IMAGE }}
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker "$(cut -d/ -f1 <<<"$FUZZCTL_IMAGE")" --quiet
+          docker pull --platform linux/amd64 "$FUZZCTL_IMAGE"
+          cid=$(docker create "$FUZZCTL_IMAGE")
+          docker cp "$cid:/usr/local/bin/fuzzctl" /usr/local/bin/fuzzctl
+          docker rm "$cid" >/dev/null
+          chmod +x /usr/local/bin/fuzzctl
+          fuzzctl 2>&1 | head -3 || true
+
+      - name: Build target + coverage twin
+        run: |
+          set -euo pipefail
+          FD=ci-test-harness/fuzz
+          REL="$FD/target/x86_64-unknown-linux-gnu/release"
+          mkdir -p bin
+          cargo +nightly fuzz build ci-test --fuzz-dir "$FD"
+          cp "$REL/ci-test" bin/ci-test
+          # Coverage twin: instrument-coverage, no sanitizer. Overwrites release/ci-test, so it is
+          # built second and copied under its own name.
+          RUSTFLAGS="-C instrument-coverage --cfg fuzzing" \
+            cargo +nightly fuzz build ci-test --fuzz-dir "$FD" --sanitizer none
+          cp "$REL/ci-test" bin/ci-test_cov
+
+      # Bad-build guard: prove the binary works before shipping it. Fails if it never gains coverage
+      # (a broken build) or crashes on shallow fuzzing (a bug to look at before publishing, not after).
+      - name: Smoke test
+        run: fuzzctl smoke bin/ci-test -runs=20000
+
+      - name: Assemble bundle
+        run: |
+          fuzzctl build-bundle \
+            -targets ci-test-harness/fuzz/targets.toml \
+            -bin bin \
+            -commit "$(git rev-parse --short=10 HEAD)" \
+            -repo "$GITHUB_REPOSITORY" \
+            -toolchain nightly \
+            -o bundle.tgz
+
+      # Writes the binaries and manifest, then flips `_latest` LAST — only after every object it
+      # points at is durable, or the fleet resolves a commit whose binary is half-uploaded.
+      - name: Publish bundle
+        env:
+          FUZZPLAT_BUCKET_PREFIX: ${{ vars.FUZZPLAT_BUCKET_PREFIX }}
+          FUZZPLAT_PLANE: public
+        run: |
+          fuzzctl push-bundle bundle.tgz \
+            -commit "$(git rev-parse --short=10 HEAD)" -local -plane public
+
+# On variables vs secrets: all four are IDENTIFIERS, not credentials, and belong in variables.
+# Authorisation is proven by GitHub signing an OIDC token naming this repo -- the provider condition
+# is `assertion.repository in [...]` and the SA may only be impersonated by
+# `principalSet://.../attribute.repository/<this repo>`. There is no key. Someone who knows the
+# provider path and SA email still cannot make GitHub sign a token for this repo, so hiding them buys
+# nothing and masking them in logs makes an auth failure read as `***`.
+#
+# The environment's real control is its protection rules: restrict deployment branches, since
+# `id-token: write` plus that binding is the ability to write to the platform's build bucket.

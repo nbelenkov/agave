@@ -1,0 +1,16 @@
+# Harness contract for the platform's CI test target. The platform reads this file and nothing else
+# about the harness.
+
+[[target]]
+name        = "ci-test"
+crate       = "ci-test-harness"
+path        = "fuzz/fuzz_targets/ci_test.rs"
+visibility  = "public"
+criticality = "low"          # a pipeline test, not a security surface
+owner       = "nbelenkov"
+
+cores       = 2              # whole cores; libFuzzer spends them as -fork=2
+min_pods    = 1              # one pod is enough to prove the fleet picked it up
+max_len     = 256
+
+corpus_format = 0

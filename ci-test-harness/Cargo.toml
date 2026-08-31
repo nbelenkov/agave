@@ -1,0 +1,14 @@
+# Standalone crate for exercising the fuzzing platform's CI submission path. It deliberately does
+# NOT depend on agave: the point is to test the pipeline (auth -> bundle -> GCS -> onboard -> fuzz),
+# and a two-second build keeps the feedback loop honest. `[workspace]` below keeps it out of agave's
+# workspace resolution so adding it cannot affect any real build.
+[package]
+name = "ci-test-harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]

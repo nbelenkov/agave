@@ -1,0 +1,5 @@
+# cargo-fuzz build output and any corpus/artifacts it writes locally.
+target/
+corpus/
+artifacts/
+coverage/
