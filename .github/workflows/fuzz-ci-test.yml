@@ -33,12 +33,17 @@ jobs:
         with:
           persist-credentials: false
 
+      # The nightly is PINNED, and it is load-bearing rather than tidiness. The coverage twin writes
+      # an llvm .profraw whose format version comes from this toolchain's LLVM, and the runner image's
+      # llvm-profdata must be able to read it. A floating `nightly` drifted ahead and produced
+      # "raw profile version mismatch: Profile uses raw profile format version = 11; expected
+      # version = 10", failing every coverage Job while fuzzing itself looked healthy.
       - name: Toolchain
         run: |
           set -euo pipefail
           # --component takes a COMMA-SEPARATED list. Space-separated, rustup reads the second
           # value as a toolchain name and fails with "invalid toolchain name".
-          rustup toolchain install nightly --component rust-src,llvm-tools-preview
+          rustup toolchain install nightly-2026-07-03 --component rust-src,llvm-tools-preview
           cargo install cargo-fuzz --locked
 
       - id: auth
@@ -75,12 +80,12 @@ jobs:
           FD=ci-test-harness/fuzz
           REL="$FD/target/x86_64-unknown-linux-gnu/release"
           mkdir -p bin
-          cargo +nightly fuzz build ci-test --fuzz-dir "$FD"
+          cargo +nightly-2026-07-03 fuzz build ci-test --fuzz-dir "$FD"
           cp "$REL/ci-test" bin/ci-test
           # Coverage twin: instrument-coverage, no sanitizer. Overwrites release/ci-test, so it is
           # built second and copied under its own name.
           RUSTFLAGS="-C instrument-coverage --cfg fuzzing" \
-            cargo +nightly fuzz build ci-test --fuzz-dir "$FD" --sanitizer none
+            cargo +nightly-2026-07-03 fuzz build ci-test --fuzz-dir "$FD" --sanitizer none
           cp "$REL/ci-test" bin/ci-test_cov
 
       # Bad-build guard: prove the binary works before shipping it. Fails if it never gains coverage
@@ -95,7 +100,7 @@ jobs:
             -bin bin \
             -commit "$(git rev-parse --short=10 HEAD)" \
             -repo "$GITHUB_REPOSITORY" \
-            -toolchain nightly \
+            -toolchain nightly-2026-07-03 \
             -o bundle.tgz
 
       # Writes the binaries and manifest, then flips `_latest` LAST — only after every object it
