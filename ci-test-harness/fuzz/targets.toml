@@ -1,10 +1,16 @@
 # Harness contract for the platform's CI test target. The platform reads this file and nothing else
 # about the harness.
 
+# The platform builds this repo from source (build service): the fuzz crate is not at fuzz/, so say
+# where it is. The cargo target is the stem of each target's `path`, so the file is named after the
+# bin (`ci-test.rs` -> `cargo fuzz build ci-test`).
+[build]
+fuzz_dir = "ci-test-harness/fuzz"
+
 [[target]]
 name        = "ci-test"
 crate       = "ci-test-harness"
-path        = "fuzz/fuzz_targets/ci_test.rs"
+path        = "fuzz/fuzz_targets/ci-test.rs"
 visibility  = "public"
 criticality = "low"          # a pipeline test, not a security surface
 owner       = "nbelenkov"
@@ -14,3 +20,7 @@ min_pods    = 1              # one pod is enough to prove the fleet picked it up
 max_len     = 256
 
 corpus_format = 0
+
+# LeakSanitizer needs ptrace at exit, which the pod seccomp profile denies; the platform's fleet
+# rule for libFuzzer targets is to turn leak detection off.
+run_env     = { ASAN_OPTIONS = "detect_leaks=0" }

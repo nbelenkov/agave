@@ -1,0 +1,61 @@
+# Ask the platform to build this repository from source (the platform's docs/build-service.md).
+# This replaced the bundle path: no toolchain, no bundle, no upload from CI — one request object
+# under this repo's own prefix, written with the same WIF identity the bundle path used. The
+# platform clones the commit, builds it with its pinned toolchain, smokes it, stores it, and moves
+# `_latest` only if the smoke passed and nothing newer landed in the meantime.
+#
+# Requires the repository environment `fuzz` (Settings -> Environments) with four environment
+# VARIABLES — identifiers, not credentials; authorisation is GitHub's OIDC token naming this repo:
+#   WIF_PROVIDER          projects/<num>/locations/global/workloadIdentityPools/fuzz-github/providers/github
+#   WIF_SERVICE_ACCOUNT   fuzz-up-<repo-slug>@<project>.iam.gserviceaccount.com
+#   BEDLAMCTL_IMAGE       <region>-docker.pkg.dev/<project>/bedlam-tools/bedlamctl:<pinned tag>
+#   BEDLAM_BUCKET_PREFIX  the platform's bucket prefix
+name: Request fuzz build
+
+on:
+  push:
+    branches: [fuzz-ci-test]
+  workflow_dispatch: # re-request the current commit without a new one
+
+permissions:
+  contents: read
+  id-token: write # GitHub OIDC -> WIF
+
+jobs:
+  request:
+    runs-on: ubuntu-latest
+    environment: fuzz
+    steps:
+      # Only for the contract check below; nothing is built here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      # bedlamctl comes from the platform's tools registry (the platform repo is private). The image
+      # is distroless and the binary static, so it is copied out and run directly. Pin the tag.
+      - name: Install bedlamctl
+        env:
+          BEDLAMCTL_IMAGE: ${{ vars.BEDLAMCTL_IMAGE }}
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker "$(cut -d/ -f1 <<<"$BEDLAMCTL_IMAGE")" --quiet
+          docker pull --platform linux/amd64 "$BEDLAMCTL_IMAGE"
+          cid=$(docker create "$BEDLAMCTL_IMAGE")
+          docker cp "$cid:/usr/local/bin/bedlamctl" /usr/local/bin/bedlamctl
+          docker rm "$cid" >/dev/null
+          chmod +x /usr/local/bin/bedlamctl
+
+      # GITHUB_REPOSITORY, GITHUB_SHA and GITHUB_REF are the defaults; the full 40-hex sha is what
+      # the builder checks its checkout against. -targets validates the contract here, so a broken
+      # manifest fails this job rather than a build the platform then has to reap.
+      - name: Request build
+        env:
+          BEDLAM_BUCKET_PREFIX: ${{ vars.BEDLAM_BUCKET_PREFIX }}
+        run: bedlamctl request-build -kind publish -targets ci-test-harness/fuzz/targets.toml

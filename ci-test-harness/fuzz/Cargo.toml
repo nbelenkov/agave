@@ -13,7 +13,7 @@ ci-test-harness = { path = ".." }
 
 [[bin]]
 name = "ci-test"
-path = "fuzz_targets/ci_test.rs"
+path = "fuzz_targets/ci-test.rs"
 test = false
 doc = false
 bench = false
