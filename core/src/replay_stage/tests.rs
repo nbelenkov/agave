@@ -144,29 +144,6 @@ fn test_has_active_leader_bank_while_sending_footer() {
     ));
 }
 
-impl ProcessActiveBanksContext {
-    fn new_for_tests(bank_forks: Arc<RwLock<BankForks>>, blockstore: Arc<Blockstore>) -> Self {
-        let (cost_update_sender, _) = bounded(1024);
-        let (votor_event_sender, _) = bounded(1024);
-        let migration_status = bank_forks.read().unwrap().migration_status();
-        Self {
-            bank_forks,
-            blockstore,
-            transaction_status_sender: None,
-            entry_notification_sender: None,
-            bank_notification_sender: None,
-            rpc_subscriptions: None,
-            slot_status_notifier: None,
-            cost_update_sender,
-            block_metadata_notifier: None,
-            votor_event_sender,
-            replay_mode: ForkReplayMode::Serial,
-            replay_verification_worker_pool: ReplayVerificationWorkerPool::new(NonZeroUsize::MIN),
-            migration_status,
-        }
-    }
-}
-
 fn transaction_history_purge_responder() -> (
     TransactionStatusSender,
     std::thread::JoinHandle<(Slot, TransactionHistoryPurgeSource)>,

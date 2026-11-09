@@ -8039,6 +8039,7 @@ dependencies = [
  "solana-bpf-loader-program",
  "solana-clock",
  "solana-cluster-type",
+ "solana-commitment-config",
  "solana-compute-budget",
  "solana-compute-budget-interface",
  "solana-compute-budget-program",

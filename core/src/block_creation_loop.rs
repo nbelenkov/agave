@@ -65,6 +65,8 @@ use {
     thiserror::Error,
 };
 
+#[cfg(any(test, feature = "dev-context-only-utils"))]
+pub(crate) mod leader_harness;
 pub(crate) mod rewards;
 mod stats;
 

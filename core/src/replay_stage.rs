@@ -1,4 +1,6 @@
 //! The `replay_stage` replays transactions broadcast by the leader.
+#[cfg(any(test, feature = "dev-context-only-utils"))]
+pub mod generation_harness;
 use {
     crate::{
         block_creation_loop::ReplayHighestFrozen,
