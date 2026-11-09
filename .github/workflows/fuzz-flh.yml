@@ -1,0 +1,103 @@
+# Fuzz build of the FLH generation target (core/fuzz). On a push to the fuzz branch it runs the
+# harness tests, then asks the bedlam build service to build that commit: one request object
+# under this repository's own prefix, written with the repository's WIF identity. The service
+# builds it with core/fuzz/build.sh, smokes it, stores it, and moves the target to it only if the
+# smoke passed and nothing newer landed in the meantime. Nothing is built for the fleet or uploaded
+# from here.
+#
+# Requires the repository environment `fuzz` (Settings -> Environments, with this branch allowed to
+# deploy) and four environment VARIABLES. They are identifiers, not credentials: GitHub's OIDC token
+# naming this repository is the authorisation.
+#   WIF_PROVIDER          projects/<num>/locations/global/workloadIdentityPools/fuzz-github/
+#                         providers/github
+#   WIF_SERVICE_ACCOUNT   fuzz-up-<repo-slug>@<project>.iam.gserviceaccount.com
+#   BEDLAMCTL_IMAGE       <region>-docker.pkg.dev/<project>/bedlam-tools/bedlamctl:<pinned tag>
+#   BEDLAM_BUCKET_PREFIX  the platform's bucket prefix
+name: FLH fuzz build
+
+on:
+  push:
+    branches: [fuzz-flh]
+  workflow_dispatch: # re-request the current commit without a new one
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  harness-tests:
+    name: Harness tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    env:
+      # Keeps a debug build of solana-core's tests inside the runner's disk.
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          sudo rm -r -f /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL
+
+      - name: Install build dependencies
+        run: bash .github/scripts/install-all-deps.sh Linux
+
+      # Every harness opens its own ledger, so the suite needs far more open files than the default
+      # 1024; it fails with EMFILE otherwise.
+      - name: Harness tests
+        run: |
+          ulimit -n 65536
+          cargo test -p solana-core --features dev-context-only-utils --lib -- \
+            replay_stage::generation_harness
+
+  request-build:
+    name: Request fuzz build
+    needs: harness-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: fuzz
+    permissions:
+      contents: read
+      id-token: write # GitHub OIDC -> WIF
+    steps:
+      # Only for the contract check below; nothing is built here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      # bedlamctl comes from the platform's tools registry (the platform repository is private).
+      # The image is distroless and the binary static, so it is copied out and run directly.
+      - name: Install bedlamctl
+        env:
+          BEDLAMCTL_IMAGE: ${{ vars.BEDLAMCTL_IMAGE }}
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker "$(cut -d/ -f1 <<<"$BEDLAMCTL_IMAGE")" --quiet
+          docker pull --platform linux/amd64 "$BEDLAMCTL_IMAGE"
+          cid=$(docker create "$BEDLAMCTL_IMAGE")
+          docker cp "$cid:/usr/local/bin/bedlamctl" /usr/local/bin/bedlamctl
+          docker rm "$cid" >/dev/null
+          chmod +x /usr/local/bin/bedlamctl
+
+      # GITHUB_REPOSITORY, GITHUB_SHA and GITHUB_REF are the defaults; the full 40-hex sha is what
+      # the builder checks its checkout against. -targets validates the contract here, so a broken
+      # one fails this job rather than a build the platform then has to reap.
+      - name: Request build
+        env:
+          BEDLAM_BUCKET_PREFIX: ${{ vars.BEDLAM_BUCKET_PREFIX }}
+        run: bedlamctl request-build -kind publish -targets core/fuzz/targets.toml

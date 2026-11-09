@@ -1,0 +1,34 @@
+# Harness contract for the bedlam fuzzing platform.
+# The platform's build service runs `build.sh` (see its header): the default cargo-fuzz recipe
+# would build with the build image's nightly, which is older than this workspace's rust-version.
+#
+# detect_leaks=0: LeakSanitizer needs ptrace, which the fleet's seccomp profile denies.
+[build]
+kind     = "script"
+fuzz_dir = "core/fuzz"
+script   = "core/fuzz/build.sh"
+
+# One run builds a ledger, a fixture of frozen forks, replay, a TransactionStatusService thread and
+# an RPC processor, then tears them down: about one run per second per core under ASan, and each run
+# fans out to the scheduler, TSS and RPC runtime threads, so a fork worker is already more than one
+# core. The input is a program: one header byte and up to 32 op bytes (`Program::from_bytes`), so
+# the fuzzer composes orderings of the discard paths rather than picking one of a fixed set.
+[[target]]
+name         = "agave-flh-generation"
+path         = "fuzz_targets/flh_generation.rs"
+criticality  = "medium"
+cores        = 2
+min_pods     = 1
+memory_gi    = 8
+corpus_gi    = 1
+timeout      = 120
+max_len      = 33
+rss_limit_mb = 3072
+# Bumped when the input encoding changes, so the fleet starts a fresh corpus lineage. 3: the
+# op alphabets grew (SetIdentity, LeaderNextSlot, WindowCertifiedPast) and header bit 2 says
+# whether the leader also leads slot 5, so every old input decodes to a different program.
+corpus_format = 3
+owner        = "security"
+# Each run's ledger goes under the system temp dir (`std::env::temp_dir()`) and is removed on
+# shutdown, so no FARF_DIR: the fleet's root is read-only.
+run_env      = { ASAN_OPTIONS = "detect_leaks=0" }
