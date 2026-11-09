@@ -123,11 +123,11 @@ use {
     },
     tokio::runtime::Runtime,
 };
+#[cfg(any(test, feature = "dev-context-only-utils"))]
+use {solana_gossip::contact_info::ContactInfo, solana_net_utils::SocketAddrSpace};
 #[cfg(test)]
 use {
-    solana_gossip::contact_info::ContactInfo,
     solana_ledger::get_tmp_ledger_path,
-    solana_net_utils::SocketAddrSpace,
     solana_program_runtime::solana_sbpf::program::BuiltinFunctionDefinition,
     solana_runtime::commitment::CommitmentSlots,
     solana_send_transaction_service::{
@@ -569,6 +569,71 @@ impl JsonRpcRequestProcessor {
             leader_schedule_cache,
             max_complete_transaction_status_slot: Arc::new(AtomicU64::default()),
             max_complete_and_rooted_transaction_status_slot: Arc::new(AtomicU64::default()),
+            prioritization_fee_cache: Some(Arc::new(PrioritizationFeeCache::default())),
+            runtime,
+        }
+    }
+
+    /// Builds a processor over components a test owns and drives itself (bank forks, the
+    /// blockstore, the commitment cache, the confirmed bank and both `TransactionStatusService`
+    /// watermarks), so the test can read back through the RPC methods what a client would see.
+    /// Transaction history is enabled; sending transactions is not wired up.
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn new_for_tests(
+        bank_forks: Arc<RwLock<BankForks>>,
+        block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
+        blockstore: Arc<Blockstore>,
+        optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
+        max_complete_transaction_status_slot: Arc<AtomicU64>,
+        max_complete_and_rooted_transaction_status_slot: Arc<AtomicU64>,
+    ) -> Self {
+        use crate::rpc_service::service_runtime;
+
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let exit = Arc::new(AtomicBool::new(false));
+        let cluster_info = Arc::new({
+            let keypair = Arc::new(Keypair::new());
+            let contact_info =
+                ContactInfo::new_localhost(&keypair.pubkey(), solana_time_utils::timestamp());
+            ClusterInfo::new(contact_info, keypair, SocketAddrSpace::Unspecified)
+        });
+        let (transaction_sender, _transaction_receiver) = unbounded();
+        let config = JsonRpcConfig {
+            enable_rpc_transaction_history: true,
+            rpc_threads: 1,
+            rpc_blocking_threads: 1,
+            ..JsonRpcConfig::default()
+        };
+        let runtime = service_runtime(
+            config.rpc_threads,
+            config.rpc_blocking_threads,
+            config.rpc_niceness_adj,
+        );
+        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&root_bank));
+        Self {
+            config,
+            snapshot_config: None,
+            bank_forks,
+            block_commitment_cache,
+            blockstore: Arc::clone(&blockstore),
+            validator_exit: create_validator_exit(exit.clone()),
+            health: Arc::new(RpcHealth::new(
+                Arc::clone(&optimistically_confirmed_bank),
+                Arc::default(),
+                0,
+                Arc::default(),
+            )),
+            cluster_info,
+            genesis_hash: Hash::default(),
+            transaction_sender,
+            bigtable_ledger_storage: None,
+            optimistically_confirmed_bank,
+            largest_accounts_cache: Arc::new(RwLock::new(LargestAccountsCache::new(30))),
+            rank_map_cache: Arc::new(RankMapCache::new(RANK_MAP_CACHE_CAPACITY)),
+            max_slots: Arc::new(MaxSlots::default()),
+            leader_schedule_cache,
+            max_complete_transaction_status_slot,
+            max_complete_and_rooted_transaction_status_slot,
             prioritization_fee_cache: Some(Arc::new(PrioritizationFeeCache::default())),
             runtime,
         }
