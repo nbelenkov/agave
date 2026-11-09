@@ -132,6 +132,7 @@ members = [
 
 exclude = [
     "ci/xtask",
+    "core/fuzz",
     "dev-bins",
     "programs/sbf",
     "svm/tests/example-programs",

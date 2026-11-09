@@ -60,6 +60,7 @@ version = "5.0.0-alpha.0"
 dependencies = [
  "crossbeam-channel",
  "solana-perf",
+ "wincode",
 ]
 
 [[package]]
@@ -835,6 +836,12 @@ dependencies = [
  "tracing",
  "web-time",
 ]
+
+[[package]]
+name = "arbitrary"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bc62ac97cc33321f50863d514c3bc38a453947a8f9e781137e47c7401020aed"
 
 [[package]]
 name = "arc-swap"
@@ -3697,6 +3704,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "libfuzzer-sys"
+version = "0.4.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9fd2f41a1cba099f79a0b6b6c35656cf7c03351a7bae8ff0f28f25270f929d2"
+dependencies = [
+ "arbitrary",
+ "cc",
+]
+
+[[package]]
 name = "libloading"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6475,6 +6492,7 @@ dependencies = [
  "solana-bls-signatures",
  "solana-clock",
  "solana-cluster-type",
+ "solana-commitment-config",
  "solana-compute-budget-interface",
  "solana-cost-model",
  "solana-ed25519-program",
@@ -6494,6 +6512,7 @@ dependencies = [
  "solana-keypair",
  "solana-leader-schedule",
  "solana-ledger",
+ "solana-loader-v3-interface",
  "solana-measure",
  "solana-message",
  "solana-metrics",
@@ -6504,6 +6523,7 @@ dependencies = [
  "solana-perf",
  "solana-poh",
  "solana-poh-config",
+ "solana-program-binaries",
  "solana-pubkey 4.4.0",
  "solana-rayon-threadlimit",
  "solana-rpc",
@@ -6552,6 +6572,14 @@ dependencies = [
  "tokio-util 0.7.19",
  "trees",
  "wincode",
+]
+
+[[package]]
+name = "solana-core-fuzz"
+version = "5.0.0-alpha.0"
+dependencies = [
+ "libfuzzer-sys",
+ "solana-core",
 ]
 
 [[package]]

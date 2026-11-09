@@ -1,0 +1,28 @@
+[package]
+name = "solana-core-fuzz"
+description = "cargo-fuzz targets over solana-core's test harnesses"
+publish = false
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+workspace = "../../dev-bins"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { workspace = true }
+solana-core = { workspace = true, features = ["dev-context-only-utils"] }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "flh_generation"
+path = "fuzz_targets/flh_generation.rs"
+test = false
+doc = false
+bench = false

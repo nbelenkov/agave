@@ -2,6 +2,7 @@
 members = [
     "../accounts-db/store-tool",
     "../conformance",
+    "../core/fuzz",
     "../ledger-tool",
     "../svm-conformance",
 ]
@@ -57,6 +58,7 @@ futures = "0.3.34"
 histogram = "0.6.9"
 itertools = "0.15.0"
 jemallocator = { package = "tikv-jemallocator", version = "0.6.0", features = ["unprefixed_malloc_on_supported_platforms"] }
+libfuzzer-sys = "0.4.13"
 log = "0.4.28"
 num_cpus = "1.17.0"
 pretty-hex = "0.4.2"
