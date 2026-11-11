@@ -1,0 +1,117 @@
+# Bedlam contract for the shred fuzz suite, built by fuzz/build.sh. Fleet name `shred-x-y` is
+# cargo bin `shred_x_y`. Dictionary paths are relative to the dir holding out/.
+# detect_leaks=0 everywhere: LeakSanitizer needs ptrace, which the fleet's seccomp profile denies
+# (it then fails every run at exit). The blockstore and banks also persist across inputs on purpose.
+
+[build]
+kind   = "script"
+script = "fuzz/build.sh"
+
+[[target]]
+name        = "shred-layout"
+crate       = "agave-shred-fuzz"
+path        = "fuzz/fuzz_targets/shred_layout.rs"
+visibility  = "public"
+criticality = "high"
+dictionary  = "out/dict/shred.dict"
+max_len     = 1232          # PACKET_DATA_SIZE
+run_env     = { ASAN_OPTIONS = "detect_leaks=0" }
+owner       = "security"
+
+[[target]]
+name        = "shred-parse"
+crate       = "agave-shred-fuzz"
+path        = "fuzz/fuzz_targets/shred_parse.rs"
+visibility  = "public"
+criticality = "high"
+dictionary  = "out/dict/shred.dict"
+max_len     = 1232
+run_env     = { ASAN_OPTIONS = "detect_leaks=0" }
+owner       = "security"
+
+[[target]]
+name        = "shred-sigverify"
+crate       = "agave-shred-fuzz"
+path        = "fuzz/fuzz_targets/shred_sigverify.rs"
+visibility  = "public"
+criticality = "high"
+max_len     = 4096
+run_env     = { ASAN_OPTIONS = "detect_leaks=0" }
+owner       = "security"
+
+[[target]]
+name        = "shred-filter-packet"
+crate       = "agave-shred-fuzz"
+path        = "fuzz/fuzz_targets/shred_filter_packet.rs"
+visibility  = "public"
+criticality = "medium"
+max_len     = 1232
+run_env     = { ASAN_OPTIONS = "detect_leaks=0" }
+owner       = "security"
+
+[[target]]
+name        = "shred-filter-rules"
+crate       = "agave-shred-fuzz"
+path        = "fuzz/fuzz_targets/shred_filter_rules.rs"
+visibility  = "public"
+criticality = "high"
+max_len     = 4096
+run_env     = { ASAN_OPTIONS = "detect_leaks=0" }
+owner       = "security"
+
+[[target]]
+name        = "shred-recover"
+crate       = "agave-shred-fuzz"
+path        = "fuzz/fuzz_targets/shred_recover.rs"
+visibility  = "public"
+criticality = "high"
+max_len     = 4096
+run_env     = { ASAN_OPTIONS = "detect_leaks=0" }
+owner       = "security"
+
+
+[[target]]
+name         = "shred-ingest-sim"
+crate        = "agave-shred-fuzz"
+path         = "fuzz/fuzz_targets/shred_ingest_sim.rs"
+visibility   = "public"
+criticality  = "high"
+max_len      = 8192
+rss_limit_mb = 2560
+timeout      = 25
+run_env      = { ASAN_OPTIONS = "detect_leaks=0" }
+owner        = "security"
+
+[[target]]
+name         = "shred-fec-verdict"
+crate        = "agave-shred-fuzz"
+path         = "fuzz/fuzz_targets/shred_fec_verdict.rs"
+visibility   = "public"
+criticality  = "high"
+max_len      = 4096
+rss_limit_mb = 2560
+timeout      = 25
+run_env      = { ASAN_OPTIONS = "detect_leaks=0" }
+owner        = "security"
+
+[[target]]
+name         = "shred-parent-markers"
+crate        = "agave-shred-fuzz"
+path         = "fuzz/fuzz_targets/shred_parent_markers.rs"
+visibility   = "public"
+criticality  = "high"
+max_len      = 4096
+rss_limit_mb = 2560
+timeout      = 25
+run_env      = { ASAN_OPTIONS = "detect_leaks=0" }
+owner        = "security"
+
+[[target]]
+name        = "shred-block-roundtrip"
+crate       = "agave-shred-fuzz"
+path        = "fuzz/fuzz_targets/shred_block_roundtrip.rs"
+visibility  = "public"
+criticality = "medium"
+max_len     = 4096
+run_env     = { ASAN_OPTIONS = "detect_leaks=0" }
+owner       = "security"

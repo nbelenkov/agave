@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "fuzz",
     "account-decoder",
     "account-decoder-client-types",
     "accounts-db",

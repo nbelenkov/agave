@@ -395,6 +395,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-shred-fuzz"
+version = "0.0.0"
+dependencies = [
+ "agave-feature-set",
+ "agave-shred-wire-format",
+ "agave-votor-messages",
+ "arbitrary",
+ "libfuzzer-sys",
+ "reed-solomon-erasure",
+ "solana-clock",
+ "solana-entry",
+ "solana-hash",
+ "solana-keypair",
+ "solana-leader-schedule",
+ "solana-ledger",
+ "solana-packet",
+ "solana-perf",
+ "solana-pubkey 4.4.0",
+ "solana-runtime",
+ "solana-sha256-hasher",
+ "solana-signature",
+ "solana-system-transaction",
+ "solana-transaction",
+ "tempfile",
+]
+
+[[package]]
 name = "agave-shred-wire-format"
 version = "5.0.0-alpha.0"
 dependencies = [
@@ -4358,6 +4385,16 @@ dependencies = [
  "hashbrown 0.16.1",
  "no_std_io2",
  "rle-decode-fast",
+]
+
+[[package]]
+name = "libfuzzer-sys"
+version = "0.4.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9fd2f41a1cba099f79a0b6b6c35656cf7c03351a7bae8ff0f28f25270f929d2"
+dependencies = [
+ "arbitrary",
+ "cc",
 ]
 
 [[package]]

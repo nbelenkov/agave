@@ -1,0 +1,9 @@
+target
+artifacts
+corpus
+*.log
+*.profraw
+*.profdata
+crash-*
+timeout-*
+slow-unit-*

@@ -1374,13 +1374,30 @@ fn finish_erasure_batch(
     Ok(*tree.root())
 }
 
-#[cfg(test)]
-pub(crate) fn finish_erasure_batch_for_tests(
+#[cfg(any(test, feature = "dev-context-only-utils"))]
+pub fn finish_erasure_batch_for_tests(
     keypair: &Keypair,
     shreds: &mut [Shred],
     chained_merkle_root: Hash,
 ) -> Result<Hash, Error> {
     finish_erasure_batch(keypair, shreds, chained_merkle_root)
+}
+
+/// Re-signs an erasure batch over its current bytes without re-encoding parity or rewriting
+/// headers, so a fuzz harness can build a leader-signed, non-canonical batch.
+#[cfg(any(test, feature = "dev-context-only-utils"))]
+pub fn reseal_erasure_batch_for_tests(
+    keypair: &Keypair,
+    shreds: &mut [Shred],
+) -> Result<Hash, Error> {
+    let tree = MerkleTree::try_new(shreds.iter().map(Shred::merkle_node))?;
+    let signature = keypair.sign_message(tree.root().as_ref());
+    for (index, shred) in shreds.iter_mut().enumerate() {
+        let proof = tree.make_merkle_proof(index, SHREDS_PER_FEC_BLOCK);
+        shred.set_merkle_proof(proof)?;
+        shred.set_signature(signature);
+    }
+    Ok(*tree.root())
 }
 
 // Builds the Merkle tree over the shreds of the erasure batch as they are,

@@ -1,0 +1,32 @@
+# Shred wire-format dictionary for the raw-byte parsers (shred_layout,
+# shred_parse). The byte at offset 64 is the variant discriminator and the byte
+# at offset 85 (data shreds) is the flags; supplying these tokens lets libFuzzer
+# flip a shred between Merkle data/code, resigned/chained, and completion-flag
+# states instead of discovering the discriminators by chance.
+
+# Variant byte = proof_size | base nibble:
+#   MerkleCode  0x60 (resigned 0x70),  MerkleData 0x90 (resigned 0xb0)
+variant_code="\x60"
+variant_code_resigned="\x70"
+variant_data="\x90"
+variant_data_resigned="\xb0"
+# proof_size 6 = canonical 32:32 batch
+variant_code_p6="\x66"
+variant_code_resigned_p6="\x76"
+variant_data_p6="\x96"
+variant_data_resigned_p6="\xb6"
+# a couple of other proof sizes (smaller / larger batches)
+variant_data_p5="\x95"
+variant_data_p7="\x97"
+
+# Data-shred completion flags (offset 85):
+#   DATA_COMPLETE_SHRED 0x40, LAST_SHRED_IN_SLOT 0xc0 (implies DATA_COMPLETE)
+flag_data_complete="\x40"
+flag_last_in_slot="\xc0"
+
+# Reference-tick low bits coexist with flags in the same byte.
+flag_complete_tick="\x7f"
+
+# Common header is 83 bytes; data header pushes payload to 88. These canonical
+# field widths help the mutator land aligned edits.
+hdr_data_size="\x53"
