@@ -17,8 +17,10 @@ fi
 NIGHTLY="nightly-$pin"
 FUZZ_DIR="$SRC/fuzz"
 TARGET_DIR="${SHRED_FUZZ_TARGET_DIR:-$SRC/target/shred-fuzz}"
-# Bedlam's 4 GiB cap less room for the dictionary, seeds and manifest.
-BUDGET="${SHRED_FUZZ_BUNDLE_BUDGET:-$((3800 * 1024 * 1024))}"
+# Well under bedlam's 4 GiB cap: finalize holds the bundle in memory (about 3.3x the binaries), and a
+# fuzzer its smoke starts inherits that peak in getrusage, which libFuzzer's rss limit reads. At 1.09
+# GB of binaries the first smoke failed at 3579 MB against the 2048 default before running an input.
+BUDGET="${SHRED_FUZZ_BUNDLE_BUDGET:-$((450 * 1024 * 1024))}"
 # Bedlam copies the contract it read into OUT; a local run uses the checkout's.
 CONTRACT="$OUT/targets.toml"
 [ -f "$CONTRACT" ] || CONTRACT="$FUZZ_DIR/targets.toml"
