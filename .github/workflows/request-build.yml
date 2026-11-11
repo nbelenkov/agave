@@ -1,0 +1,54 @@
+# Asks bedlam to build, smoke and publish each pushed commit (bedlam's docs/build-service.md).
+# The `fuzz` environment holds identifiers, not credentials: WIF_PROVIDER, WIF_SERVICE_ACCOUNT,
+# BEDLAMCTL_IMAGE and BEDLAM_BUCKET_PREFIX. Authorisation is GitHub's OIDC token naming this repo.
+name: Request fuzz build
+
+on:
+  push:
+    branches: [shred-fuzz-v2]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  request:
+    name: Request fuzz build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: fuzz
+    permissions:
+      contents: read
+      id-token: write # GitHub OIDC token, exchanged through WIF for the repo's uploader identity
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Install bedlamctl
+        env:
+          BEDLAMCTL_IMAGE: ${{ vars.BEDLAMCTL_IMAGE }}
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker "$(cut -d/ -f1 <<<"$BEDLAMCTL_IMAGE")" --quiet
+          docker pull --platform linux/amd64 "$BEDLAMCTL_IMAGE"
+          cid=$(docker create "$BEDLAMCTL_IMAGE")
+          docker cp "$cid:/usr/local/bin/bedlamctl" /usr/local/bin/bedlamctl
+          docker rm "$cid" >/dev/null
+          chmod +x /usr/local/bin/bedlamctl
+
+      # Validates the contract at the path bedlam reads (a symlink to fuzz/targets.toml), so a
+      # broken one fails this job, not a platform build.
+      - name: Request build
+        env:
+          BEDLAM_BUCKET_PREFIX: ${{ vars.BEDLAM_BUCKET_PREFIX }}
+        run: bedlamctl request-build -kind publish -targets core/fuzz/targets.toml
