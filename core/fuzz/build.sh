@@ -50,3 +50,7 @@ RUSTFLAGS="-C instrument-coverage --cfg fuzzing" \
   cargo +"$toolchain" fuzz build "$cargo_target" --fuzz-dir "$fuzz_dir" \
   --target-dir "$target_dir" --sanitizer none
 cp "$release/$cargo_target" "$OUT/bin/${target_name}_cov"
+
+# bedlam caps a bundle member at 512 MiB, and the line tables are most of the ASan binary (629 MB,
+# 108 MB without). Function names stay in .symtab and the twin keeps its __llvm_cov* sections.
+strip --strip-debug "$OUT/bin/$target_name" "$OUT/bin/${target_name}_cov"
