@@ -5,7 +5,11 @@ use {
         constants as wire,
         kind::{Code, Data},
     },
+    agave_votor_messages::{
+        migration::MigrationStatus, unverified_vote_message::UnverifiedCertificate,
+    },
     arbitrary::Arbitrary,
+    crossbeam_channel::{Receiver, Sender, unbounded},
     solana_clock::DEFAULT_NS_PER_TICK_400_MS,
     solana_entry::{block_component::ParsedBlockComponent, entry::Entry},
     solana_hash::Hash,
@@ -69,6 +73,8 @@ thread_local! {
     // `new_dummy_retransmit_sender` spawns a worker thread, so share one.
     static RETRANSMIT: RetransmitSender = new_dummy_retransmit_sender();
     static STORE: RefCell<Option<(Blockstore, TempDir)>> = const { RefCell::new(None) };
+    static CERTIFICATES: (Sender<Forwarded>, Receiver<Forwarded>) = unbounded();
+    static COMPLETED_SLOTS: (Sender<Vec<u64>>, Receiver<Vec<u64>>) = unbounded();
     static NEXT_SLOT: Cell<u64> = const { Cell::new(0) };
     static INPUTS: Cell<u64> = const { Cell::new(0) };
 }
@@ -242,9 +248,10 @@ pub fn with_blockstore<R>(
     run: impl FnOnce(&Blockstore, u64) -> R,
 ) -> Option<R> {
     let root = bank.slot();
+    COMPLETED_SLOTS.with(|(_, receiver)| receiver.try_iter().for_each(drop));
     if fresh_mode() {
         let dir = TempDir::new().ok()?;
-        let blockstore = Blockstore::open(dir.path()).ok()?;
+        let blockstore = open_blockstore(&dir)?;
         return Some(run(&blockstore, root + 1));
     }
     // Mirrors the filter's private `max_shred_slot`.
@@ -257,7 +264,7 @@ pub fn with_blockstore<R>(
     let stale = STORE.with(|c| c.borrow().is_none()) || inputs.is_multiple_of(REOPEN_EVERY);
     if exhausted || stale {
         let dir = TempDir::new().ok()?;
-        let blockstore = Blockstore::open(dir.path()).ok()?;
+        let blockstore = open_blockstore(&dir)?;
         STORE.with(|c| c.replace(Some((blockstore, dir))));
         NEXT_SLOT.with(|n| n.set(root + 1));
     }
@@ -271,6 +278,25 @@ pub fn with_blockstore<R>(
             .as_ref()
             .map(|(blockstore, _)| run(blockstore, base))
     })
+}
+
+/// Wired like a validator's blockstore once Alpenglow is active: it signals completed slots
+/// (without a listener it never forwards footer certificates) and forwards block-footer
+/// certificates to a per-thread channel that `take_forwarded_certificates` drains.
+fn open_blockstore(dir: &TempDir) -> Option<Blockstore> {
+    let blockstore = Blockstore::open(dir.path()).ok()?;
+    blockstore.add_completed_slots_signal(COMPLETED_SLOTS.with(|(sender, _)| sender.clone()));
+    let sender = CERTIFICATES.with(|(sender, _)| sender.clone());
+    blockstore.set_certificate_sender(sender, Arc::new(MigrationStatus::post_migration_status()));
+    Some(blockstore)
+}
+
+/// A forwarded certificate with the slot of the block that carried it.
+pub type Forwarded = (u64, UnverifiedCertificate);
+
+/// Certificates forwarded since the last call.
+pub fn take_forwarded_certificates() -> Vec<Forwarded> {
+    CERTIFICATES.with(|(_, receiver)| receiver.try_iter().collect())
 }
 
 fn fresh_mode() -> bool {

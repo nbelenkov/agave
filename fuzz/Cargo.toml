@@ -19,13 +19,13 @@ agave-shred-wire-format = { workspace = true }
 solana-clock = { workspace = true }
 solana-hash = { workspace = true }
 solana-keypair = { workspace = true }
-solana-entry = { workspace = true }
+solana-entry = { workspace = true, features = ["dev-context-only-utils"] }
 solana-transaction = { workspace = true }
 solana-system-transaction = { workspace = true }
 solana-runtime = { workspace = true, features = ["dev-context-only-utils"] }
 solana-leader-schedule = { workspace = true }
 agave-feature-set = { workspace = true }
-agave-votor-messages = { workspace = true }
+agave-votor-messages = { workspace = true, features = ["dev-context-only-utils"] }
 solana-perf = { workspace = true, features = ["dev-context-only-utils"] }
 solana-packet = { workspace = true }
 tempfile = { workspace = true }
@@ -33,6 +33,8 @@ solana-pubkey = { workspace = true }
 solana-signature = { workspace = true }
 solana-sha256-hasher = { workspace = true }
 reed-solomon-erasure = { workspace = true }
+crossbeam-channel = { workspace = true }
+solana-bls-signatures = { workspace = true }
 
 [lints.clippy]
 arithmetic_side_effects = "allow"

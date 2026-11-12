@@ -100,6 +100,7 @@ crate        = "agave-shred-fuzz"
 path         = "fuzz/fuzz_targets/shred_parent_markers.rs"
 visibility   = "public"
 criticality  = "high"
+corpus_format = 1           # 1: block footers, input layout changed
 max_len      = 4096
 rss_limit_mb = 2560
 timeout      = 25

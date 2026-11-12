@@ -9,20 +9,31 @@
 //! P4 a complete slot's double Merkle root equals a recomputation over its FEC-set roots and
 //!    the effective parent.
 //! P5 the markers replay decodes match the parent blockstore recorded.
+//! P6 a complete live slot forwards exactly the finalization certificates of the footer in its
+//!    second-to-last FEC set (where a leader puts it), tagged with the slot; a dead slot forwards
+//!    those or nothing, an incomplete one nothing.
 
 #![no_main]
 
 use {
     agave_shred_fuzz::{
-        Gates, LEADER_SEED, SHRED_VERSION, bank_for, recovery_context, with_blockstore,
+        Gates, LEADER_SEED, SHRED_VERSION, bank_for, recovery_context, take_forwarded_certificates,
+        with_blockstore,
     },
-    agave_votor_messages::consensus_message::BlockId,
+    agave_votor_messages::{
+        certificate::CertificateType,
+        consensus_message::{Block as CertifiedBlock, BlockId},
+        unverified_vote_message::UnverifiedCertificate,
+    },
     arbitrary::Arbitrary,
     libfuzzer_sys::fuzz_target,
+    solana_bls_signatures::{
+        Keypair as BlsKeypair, SignatureCompressed, signature::points::SignatureAffine,
+    },
     solana_entry::{
         block_component::{
-            BlockComponent, ParsedBlockComponent, UpdateParentV1, VersionedBlockHeader,
-            VersionedBlockMarker,
+            BlockComponent, BlockFinalizationCert, BlockFooterV1, ParsedBlockComponent,
+            UpdateParentV1, VersionedBlockHeader, VersionedBlockMarker, VotesAggregate,
         },
         entry::Entry,
     },
@@ -39,7 +50,7 @@ use {
     },
     solana_runtime::{bank::Bank, leader_schedule_utils::leader_slot_index},
     solana_sha256_hasher::hashv,
-    std::sync::Arc,
+    std::sync::{Arc, OnceLock},
 };
 
 /// The two delivery slots sit one leader window (4 slots) apart.
@@ -50,6 +61,7 @@ const MAX_UPDATES: usize = 2;
 struct Input {
     // Fixed-size fields before the Vec, so a short input still sets every knob.
     gates: Gates,
+    footer: Option<Footer>,
     window_pos: u8,
     shred_parent_back: u8,
     header: Option<Marker>,
@@ -57,6 +69,43 @@ struct Input {
     schedules: [Schedule; 2],
     withhold: u64,
     updates: Vec<Marker>,
+}
+
+#[derive(Arbitrary, Debug, Clone, Copy)]
+struct Footer {
+    placement: Placement,
+    cert: Option<Cert>,
+    bank_hash: u8,
+    user_agent_len: u8,
+}
+
+#[derive(Arbitrary, Debug, Clone, Copy)]
+enum Placement {
+    /// Second-to-last, before the final entry batch, as a leader places it.
+    Honest,
+    Last,
+    /// Followed by two entry batches.
+    Early,
+    /// Two footers, the second one placed honestly.
+    Twice,
+    BeforeUpdateParent,
+}
+
+#[derive(Arbitrary, Debug, Clone, Copy)]
+struct Cert {
+    block: Marker,
+    /// With a notarization aggregate (Notarize and Finalize), else FinalizeFast.
+    notar: bool,
+    final_sig: Sig,
+    notar_sig: Sig,
+    bitmap_len: u8,
+}
+
+#[derive(Arbitrary, Debug, Clone, Copy)]
+enum Sig {
+    Valid(u8),
+    /// Rarely a point on the curve, so the footer usually forwards nothing.
+    Junk(u8),
 }
 
 /// `id` is a one-byte seed, so markers naming the same block are common.
@@ -86,6 +135,8 @@ struct Block {
     header: Option<Parent>,
     /// With the first data index of each one's FEC set.
     updates: Vec<(Parent, u32)>,
+    /// The certificate of a footer in the second-to-last component, if any.
+    forwardable: Option<BlockFinalizationCert>,
     shreds: Vec<Shred>,
 }
 
@@ -113,6 +164,7 @@ fn run(bank: &Arc<Bank>, blockstore: &Blockstore, base: u64, input: &Input) {
     let pos = u64::from(input.window_pos % 4);
     let slot_a = start + (4 + pos - start % 4) % 4;
     let mut outcomes = Vec::with_capacity(2);
+    take_forwarded_certificates();
     for (k, schedule) in input.schedules.iter().enumerate() {
         let slot = slot_a + 4 * k as u64;
         let Some(block) = build_block(slot, input, &leader) else {
@@ -123,6 +175,7 @@ fn run(bank: &Arc<Bank>, blockstore: &Blockstore, base: u64, input: &Input) {
         let outcome = outcome(blockstore, slot);
         check_reference(blockstore, &block, &outcome);
         check_complete_block(blockstore, &block);
+        check_forwarded(blockstore, &block);
         outcomes.push(outcome);
     }
     assert_eq!(
@@ -163,22 +216,37 @@ fn build_block(slot: u64, input: &Input, leader: &Keypair) -> Option<Block> {
     for i in 0..entries_before {
         components.push(entry_batch(i));
     }
-    let first_update = components.len();
+    let mut update_at = Vec::with_capacity(updates.len());
+    if let Some(footer) = input
+        .footer
+        .filter(|f| matches!(f.placement, Placement::BeforeUpdateParent))
+    {
+        components.push(block_footer(slot, &footer));
+    }
     for (i, u) in updates.iter().enumerate() {
+        update_at.push(components.len());
         components.push(update_parent(*u));
         components.push(entry_batch(entries_before + i));
     }
+    if let Some(footer) = &input.footer {
+        push_footer(&mut components, slot, footer);
+    }
+    let forwardable = components
+        .len()
+        .checked_sub(2)
+        .and_then(|i| footer_cert(&components[i]));
     let (shreds, starts) = shred_components(slot, shred_parent, &components, leader)?;
     let updates = updates
         .iter()
-        .enumerate()
-        .map(|(i, u)| (*u, starts[first_update + 2 * i]))
+        .zip(update_at)
+        .map(|(u, at)| (*u, starts[at]))
         .collect();
     Some(Block {
         slot,
         shred_parent,
         header,
         updates,
+        forwardable,
         shreds,
     })
 }
@@ -198,6 +266,156 @@ fn update_parent(parent: Parent) -> BlockComponent {
         new_parent_block_id: BlockId::from(parent.id),
     };
     BlockComponent::BlockMarker(VersionedBlockMarker::from_update_parent(marker))
+}
+
+/// Appends the footer, and the entry batches its placement calls for, after the last component.
+fn push_footer(components: &mut Vec<BlockComponent>, slot: u64, footer: &Footer) {
+    const FINAL: usize = 200;
+    match footer.placement {
+        Placement::Honest | Placement::BeforeUpdateParent => {
+            if matches!(footer.placement, Placement::Honest) {
+                components.push(block_footer(slot, footer));
+            }
+            components.push(entry_batch(FINAL));
+        }
+        Placement::Last => components.push(block_footer(slot, footer)),
+        Placement::Early => {
+            components.push(block_footer(slot, footer));
+            components.push(entry_batch(FINAL + 1));
+            components.push(entry_batch(FINAL));
+        }
+        Placement::Twice => {
+            components.push(block_footer(slot, footer));
+            components.push(block_footer(slot, footer));
+            components.push(entry_batch(FINAL));
+        }
+    }
+}
+
+fn block_footer(slot: u64, footer: &Footer) -> BlockComponent {
+    let block_final_cert = footer.cert.and_then(|cert| finalization_cert(slot, &cert));
+    let footer = BlockFooterV1 {
+        bank_hash: Hash::new_from_array([footer.bank_hash; 32]),
+        block_producer_time_nanos: u64::from(footer.bank_hash),
+        block_user_agent: vec![b'a'; usize::from(footer.user_agent_len)],
+        block_final_cert,
+        skip_reward_cert: None,
+        notar_reward_cert: None,
+    };
+    BlockComponent::BlockMarker(VersionedBlockMarker::from_block_footer(footer))
+}
+
+fn finalization_cert(slot: u64, cert: &Cert) -> Option<BlockFinalizationCert> {
+    let bitmap = vec![0xa5; usize::from(cert.bitmap_len % 32)];
+    let aggregate = |sig: Sig| VotesAggregate::new(compressed(sig), bitmap.clone());
+    Some(BlockFinalizationCert {
+        slot: slot.checked_sub(1 + u64::from(cert.block.back % 16))?,
+        block_id: BlockId::from(Hash::new_from_array([cert.block.id; 32])),
+        final_aggregate: aggregate(cert.final_sig),
+        notar_aggregate: cert.notar.then(|| aggregate(cert.notar_sig)),
+    })
+}
+
+fn compressed(sig: Sig) -> SignatureCompressed {
+    static VALID: OnceLock<Vec<SignatureCompressed>> = OnceLock::new();
+    match sig {
+        Sig::Valid(i) => {
+            let valid = VALID.get_or_init(|| {
+                (0..4u8)
+                    .map(|seed| {
+                        let keypair = BlsKeypair::derive(&[seed + 1; 32]).expect("valid ikm");
+                        SignatureCompressed::from(&SignatureAffine::from(keypair.sign(b"footer")))
+                    })
+                    .collect()
+            });
+            valid[usize::from(i) % valid.len()]
+        }
+        Sig::Junk(byte) => SignatureCompressed([byte; 96]),
+    }
+}
+
+fn footer_cert(component: &BlockComponent) -> Option<BlockFinalizationCert> {
+    let BlockComponent::BlockMarker(VersionedBlockMarker::V1(marker)) = component else {
+        return None;
+    };
+    let solana_entry::block_component::VersionedBlockFooter::V1(footer) =
+        marker.as_block_footer()?;
+    footer.block_final_cert.clone()
+}
+
+/// P6
+fn check_forwarded(blockstore: &Blockstore, block: &Block) {
+    let slot = block.slot;
+    let forwarded = take_forwarded_certificates();
+    let full = blockstore
+        .meta(slot)
+        .ok()
+        .flatten()
+        .is_some_and(|meta| meta.is_full());
+    let expected = match (&block.forwardable, full) {
+        (Some(cert), true) => expected_certificates(cert),
+        _ => vec![],
+    };
+    let mut got: Vec<CertKey> = forwarded
+        .iter()
+        .map(|(carrier, cert)| {
+            assert_eq!(
+                *carrier, slot,
+                "P6: a certificate was forwarded with carrier slot {carrier}, delivering {slot}"
+            );
+            cert_key(cert)
+        })
+        .collect();
+    got.sort();
+    if blockstore.is_dead(slot) && got.is_empty() {
+        return;
+    }
+    assert_eq!(
+        got, expected,
+        "P6: slot {slot} (full {full}) forwarded the wrong footer certificates"
+    );
+}
+
+type CertKey = (CertificateType, Vec<u8>, Vec<u8>, u16);
+
+fn cert_key(cert: &UnverifiedCertificate) -> CertKey {
+    (
+        cert.cert_type,
+        cert.signature.0.to_vec(),
+        cert.bitmap.clone(),
+        cert.shred_version,
+    )
+}
+
+/// What a footer certificate stands for: Notarize and Finalize with a notarization aggregate,
+/// FinalizeFast without; nothing if a signature is not a curve point.
+fn expected_certificates(cert: &BlockFinalizationCert) -> Vec<CertKey> {
+    let block = CertifiedBlock {
+        slot: cert.slot,
+        block_id: cert.block_id,
+    };
+    let key = |cert_type, aggregate: &VotesAggregate| -> Option<CertKey> {
+        let signature = aggregate.uncompress_signature().ok()?;
+        Some((
+            cert_type,
+            signature.0.to_vec(),
+            aggregate.bitmap().to_vec(),
+            SHRED_VERSION,
+        ))
+    };
+    let keys = match &cert.notar_aggregate {
+        Some(notar) => vec![
+            key(CertificateType::Notarize(block), notar),
+            key(CertificateType::Finalize(cert.slot), &cert.final_aggregate),
+        ],
+        None => vec![key(
+            CertificateType::FinalizeFast(block),
+            &cert.final_aggregate,
+        )],
+    };
+    let mut keys: Vec<CertKey> = keys.into_iter().collect::<Option<_>>().unwrap_or_default();
+    keys.sort();
+    keys
 }
 
 /// Each component in its own FEC sets, chained as a leader does, with each one's first data
