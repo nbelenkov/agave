@@ -819,8 +819,13 @@ fn whole_block(
     if admitted <= DATA_SHREDS_PER_FEC_BLOCK {
         return;
     }
+    // Without SIMD-0504, a coding shred whose position contradicts its index skews its set's
+    // erasure meta (the coding range is index - position), which can keep that set from ever
+    // being checked. The honest sets must still all pass.
+    let skewed = !stricter_active(bank, slot) && matches!(input.fault, Fault::SwapPositions { .. });
+    let faulted_failures = if skewed { 0..=1 } else { 1..=1 };
     assert!(
-        verdict.checks_failed == 1 && verdict.checks_passed == n - 1,
+        faulted_failures.contains(&verdict.checks_failed) && verdict.checks_passed == n - 1,
         "whole block: set {k} of {n} faulted ({:?}) should fail alone at slot {slot}: {verdict:?}",
         input.fault,
     );
