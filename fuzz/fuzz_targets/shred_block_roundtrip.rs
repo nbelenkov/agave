@@ -1,10 +1,12 @@
-//! Entries with signed transfers, shredded into a complete slot in a fresh blockstore: replay's
-//! and RPC's decoders must each return exactly those entries.
+//! Entries with signed transfers, shredded into a complete slot and stored: replay's and RPC's
+//! decoders must each return exactly those entries.
 
 #![no_main]
 
 use {
-    agave_shred_fuzz::{LEADER_SEED, summarize_entries, summarize_views},
+    agave_shred_fuzz::{
+        Gates, LEADER_SEED, bank_for, summarize_entries, summarize_views, with_blockstore,
+    },
     arbitrary::Arbitrary,
     libfuzzer_sys::fuzz_target,
     solana_entry::entry::Entry,
@@ -16,12 +18,12 @@ use {
     },
     solana_pubkey::Pubkey,
     solana_transaction::versioned::VersionedTransaction,
-    tempfile::TempDir,
 };
 
 const MAX_ENTRIES: usize = 64;
 const MAX_TXS_PER_ENTRY: usize = 4;
 const MAX_TXS_TOTAL: usize = 64;
+const SLOTS: u64 = 16;
 
 #[derive(Arbitrary, Debug)]
 struct Input {
@@ -69,8 +71,19 @@ fuzz_target!(|input: Input| {
         });
     }
 
-    let slot = u64::from(input.slot_offset) + 1;
-    let Ok(shredder) = Shredder::new(slot, slot - 1, 0, input.version) else {
+    let bank = bank_for(Gates {
+        proof_size: false,
+        stricter: false,
+        at_activation: false,
+    });
+    with_blockstore(&bank, SLOTS, |blockstore, base| {
+        let slot = base + 1 + u64::from(input.slot_offset) % (SLOTS - 1);
+        roundtrip(blockstore, slot, input.version, &entries);
+    });
+});
+
+fn roundtrip(blockstore: &Blockstore, slot: u64, version: u16, entries: &[Entry]) {
+    let Ok(shredder) = Shredder::new(slot, slot - 1, 0, version) else {
         return;
     };
     let leader = Keypair::new_from_array(LEADER_SEED);
@@ -78,7 +91,7 @@ fuzz_target!(|input: Input| {
 
     let shreds: Vec<Shred> = shredder.make_merkle_shreds_from_entries(
         &leader,
-        &entries,
+        entries,
         true, // is_last_in_slot
         Hash::default(),
         0, // next_shred_index
@@ -89,10 +102,6 @@ fuzz_target!(|input: Input| {
         return;
     }
 
-    let Ok(dir) = TempDir::new() else { return };
-    let Ok(blockstore) = Blockstore::open(dir.path()) else {
-        return;
-    };
     // Trusted, so every shred is stored and the slot completes.
     if blockstore
         .insert_shreds(shreds, /*is_trusted:*/ true)
@@ -101,7 +110,7 @@ fuzz_target!(|input: Input| {
         return;
     }
 
-    let expected = summarize_entries(&entries);
+    let expected = summarize_entries(entries);
     let (components, _, _) = blockstore
         .get_slot_component_views_with_shred_info(slot, 0, /*allow_dead_slots:*/ false)
         .unwrap_or_default();
@@ -121,4 +130,4 @@ fuzz_target!(|input: Input| {
         rpc.len(),
         entries.len(),
     );
-});
+}
