@@ -191,11 +191,11 @@ impl LeaderSide {
         fast_leader_handover: bool,
     ) -> Result<(), String> {
         let mut slot_metrics = SlotMetrics::new(slot, fast_leader_handover);
-        request_reward_certs(&mut self.ctx, &mut slot_metrics, slot)
-            .map_err(|err| err.to_string())?;
+        request_reward_certs(&self.ctx, &mut slot_metrics, slot).map_err(|err| err.to_string())?;
         // The rewards service takes the request and has nothing to offer: slot 4 is far below
-        // the placeholder genesis certificate slot. The footer does not wait for a reply, so it
-        // goes out without reward certificates, as it does when the service is late.
+        // the placeholder genesis certificate slot. `complete` hands the loop no request token,
+        // so the footer goes out without reward certificates and without the loop's bounded
+        // wait for a reply (#16749), as when the request could not be sent.
         for _request in self.reward_requests.try_iter() {}
         let root_bank = self.ctx.bank_forks.read().unwrap().root_bank();
         let timeout = block_timeout(&root_bank, slot);
@@ -286,6 +286,14 @@ impl LeaderSide {
             "votor's highest ParentReady only rises"
         );
         *highest_parent_ready = (slot, Block { slot, block_id });
+    }
+
+    /// `set-identity` onto `identity`, as the loop picks it up at a window start (`run_loop`): it
+    /// caches the new identity and refreshes its next leader slot (#16637). The harness never
+    /// sets the slot clock, so the refresh searches from the root and reads no wall-clock time.
+    pub(crate) fn set_identity(&mut self, identity: Pubkey) {
+        self.ctx.my_pubkey = identity;
+        refresh_next_leader_slot(&self.ctx);
     }
 
     /// Production failed: the working bank is aborted (R4).

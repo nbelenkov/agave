@@ -24,11 +24,30 @@ corpus_gi    = 1
 timeout      = 120
 max_len      = 33
 rss_limit_mb = 3072
-# Bumped when the input encoding changes, so the fleet starts a fresh corpus lineage. 3: the
-# op alphabets grew (SetIdentity, LeaderNextSlot, WindowCertifiedPast) and header bit 2 says
-# whether the leader also leads slot 5, so every old input decodes to a different program.
-corpus_format = 3
+# Bumped when the input encoding changes, so the fleet starts a fresh corpus lineage. 4: ops are
+# decoded through fixed tables with spare slots (`Op::REPLAY_TABLE`, `Op::LEADER_TABLE`), so a new
+# op no longer reshuffles every input; format 3's inputs decode to other programs under it.
+corpus_format = 4
 owner        = "security"
+# The coverage figure counts only the code the discard paths run through, matched as path
+# substrings. Unscoped, every line linked into the binary counts, and the figure hides where
+# programs stop reaching. The harness itself (replay_stage/generation_harness.rs,
+# block_creation_loop/leader_harness.rs) is left out on purpose.
+coverage_paths = [
+  "core/src/replay_stage.rs",
+  "core/src/replay_stage/update_parent.rs",
+  "core/src/replay_stage/dead_slots.rs",
+  "core/src/block_creation_loop.rs",
+  "ledger/src/blockstore_processor.rs",
+  "ledger/src/blockstore.rs",
+  "ledger/src/blockstore/blockstore_purge.rs",
+  "rpc/src/transaction_status_service.rs",
+  "rpc/src/optimistically_confirmed_bank_tracker.rs",
+  "rpc/src/rpc.rs",
+  "runtime/src/bank_forks.rs",
+  "accounts-db/src/accounts_cache.rs",
+  "votor/src/root_utils.rs",
+]
 # Each run's ledger goes under the system temp dir (`std::env::temp_dir()`) and is removed on
 # shutdown, so no FARF_DIR: the fleet's root is read-only.
 run_env      = { ASAN_OPTIONS = "detect_leaks=0" }

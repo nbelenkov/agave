@@ -85,7 +85,9 @@ use {
             GenesisConfigInfo, ValidatorVoteKeypairs,
             create_genesis_config_with_tower_vote_accounts,
         },
-        transaction_execution::{TransactionStatusMessage, TransactionStatusSender},
+        transaction_execution::{
+            TransactionStatusBatch, TransactionStatusMessage, TransactionStatusSender,
+        },
     },
     solana_signature::Signature,
     solana_signer::Signer,
@@ -102,7 +104,7 @@ use {
     solana_unified_scheduler_pool::DefaultSchedulerPool,
     std::{
         cell::Cell,
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         num::NonZeroUsize,
         sync::{
             Arc, Condvar, Mutex, OnceLock, RwLock,
@@ -283,7 +285,35 @@ impl ProcessActiveBanksContext {
 
 /// Shreds per FEC set; block components are placed at multiples of this index.
 const FEC_SET_SHREDS: u32 = 32;
-const TSS_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// The known case for history findings at a startup root whose queued status writes a crash
+/// threw away: the rows the slot should have stay missing, and rows a lost purge should have
+/// removed stay served. Upstream accepts it (raised in #14432's review; #16227 drains only a
+/// graceful exit).
+const CRASH_LOST_ROOT_HISTORY: &str = "R1 x C4: a crash loses the startup root's queued history";
+
+/// How long a harness wait runs before it says so. Not a deadline: an outcome must not depend on
+/// wall-clock time, and a loaded fleet pod runs the same program tens of times slower than a
+/// workstation. A wait that never ends is a hang, which the fuzzer's own timeout reports with a
+/// stack.
+const SLOW_WAIT_NOTE: Duration = Duration::from_secs(10);
+
+/// How long a wait may run in a unit test before it fails it, so a broken test fails instead of
+/// hanging. The fuzz target has no such limit; the fuzzer's own timeout covers it.
+#[cfg(test)]
+const TEST_WAIT_LIMIT: Duration = Duration::from_secs(120);
+
+/// Notes once, on stderr, that a wait has run past `SLOW_WAIT_NOTE`; in a fuzz build it changes
+/// nothing else.
+fn note_slow_wait(started: std::time::Instant, noted: &mut bool, what: impl FnOnce() -> String) {
+    #[cfg(test)]
+    if started.elapsed() > TEST_WAIT_LIMIT {
+        panic!("waited {TEST_WAIT_LIMIT:?} for {}", what());
+    }
+    if !*noted && started.elapsed() > SLOW_WAIT_NOTE {
+        eprintln!("still waiting after {SLOW_WAIT_NOTE:?}: {}", what());
+        *noted = true;
+    }
+}
 
 /// The scratch state `OptimisticallyConfirmedBankTracker` keeps between notifications. In a
 /// validator the tracker thread owns these (`optimistically_confirmed_bank_tracker.rs:114-117`);
@@ -426,11 +456,14 @@ impl GenerationModel {
 struct TssGate {
     open: Arc<(Mutex<bool>, Condvar)>,
     exit: Arc<AtomicBool>,
-    /// While set, messages are dropped instead of forwarded. A process that crashes with a TSS
+    /// While set, messages are discarded instead of forwarded. A process that crashes with a TSS
     /// backlog never writes it, so those rows are simply lost. A graceful exit no longer loses
     /// them: since #16227 the validator joins TSS after its producers stop, and the join drains
-    /// the queue (`TransactionStatusService::join`).
+    /// the queue (`TransactionStatusService::join`). See `TssGate::discarded` for what a
+    /// discarded batch still carries.
     discard: Arc<AtomicBool>,
+    /// Slots the discarded messages were for, until `take_lost_slots` reads them.
+    lost_slots: Arc<Mutex<BTreeSet<Slot>>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -444,10 +477,12 @@ impl TssGate {
         let open = Arc::new((Mutex::new(true), Condvar::new()));
         let exit = Arc::new(AtomicBool::new(false));
         let discard = Arc::new(AtomicBool::new(false));
+        let lost_slots = Arc::new(Mutex::new(BTreeSet::new()));
         let thread = std::thread::spawn({
             let open = open.clone();
             let exit = exit.clone();
             let discard = discard.clone();
+            let lost_slots = lost_slots.clone();
             move || {
                 while !exit.load(Ordering::Relaxed) {
                     let message = match proxy.recv_timeout(Self::POLL) {
@@ -461,9 +496,17 @@ impl TssGate {
                         is_open = condvar.wait_timeout(is_open, Self::POLL).unwrap().0;
                     }
                     drop(is_open);
-                    if discard.load(Ordering::Relaxed) {
-                        continue;
-                    }
+                    let message = if discard.load(Ordering::Relaxed) {
+                        if let Some(slot) = Self::message_slot(&message) {
+                            lost_slots.lock().unwrap().insert(slot);
+                        }
+                        match Self::discarded(message) {
+                            Some(message) => message,
+                            None => continue,
+                        }
+                    } else {
+                        message
+                    };
                     if tss_input.send(message).is_err() {
                         return;
                     }
@@ -474,7 +517,50 @@ impl TssGate {
             open,
             exit,
             discard,
+            lost_slots,
             thread: Some(thread),
+        }
+    }
+
+    /// The slot a message writes history for, if it writes any.
+    fn message_slot(message: &TransactionStatusMessage) -> Option<Slot> {
+        match message {
+            TransactionStatusMessage::Batch((batch, _)) => Some(batch.slot),
+            TransactionStatusMessage::Freeze(bank) => Some(bank.slot()),
+            TransactionStatusMessage::Rooted { slot }
+            | TransactionStatusMessage::PurgeTransactionHistory { slot, .. } => Some(*slot),
+        }
+    }
+
+    /// The slots discarded messages were for since the last call.
+    fn take_lost_slots(&self) -> BTreeSet<Slot> {
+        std::mem::take(&mut *self.lost_slots.lock().unwrap())
+    }
+
+    /// What reaches TSS of a message the crash discards. Its rows are lost, but a batch's work id
+    /// still has to complete: TSS advances the shared dependency tracker only over a contiguous
+    /// run of work ids (#16419), and one TSS thread and tracker serve every process here, so a
+    /// dropped id would leave a gap no later drain gets past. A new validator starts a fresh
+    /// tracker with nothing outstanding; an empty batch carrying the id gets this one to the same
+    /// place and writes nothing.
+    fn discarded(message: TransactionStatusMessage) -> Option<TransactionStatusMessage> {
+        match message {
+            TransactionStatusMessage::Batch((batch, Some(work_id))) => {
+                Some(TransactionStatusMessage::Batch((
+                    TransactionStatusBatch {
+                        slot: batch.slot,
+                        bank_id: batch.bank_id,
+                        transactions: vec![],
+                        commit_results: vec![],
+                        balances: TransactionBalancesSet::new(vec![], vec![]),
+                        token_balances: TransactionTokenBalancesSet::new(vec![], vec![]),
+                        costs: vec![],
+                        transaction_indexes: vec![],
+                    },
+                    Some(work_id),
+                )))
+            }
+            _ => None,
         }
     }
 
@@ -1441,7 +1527,8 @@ impl Harness {
         if signatures.is_empty() || !self.tss_gate.as_ref().is_some_and(TssGate::is_open) {
             return;
         }
-        let deadline = std::time::Instant::now() + TSS_DRAIN_TIMEOUT;
+        let started = std::time::Instant::now();
+        let mut noted = false;
         loop {
             let missing = signatures
                 .iter()
@@ -1455,13 +1542,9 @@ impl Harness {
             if missing == 0 {
                 return;
             }
-            if std::time::Instant::now() > deadline {
-                warn!(
-                    "rows for {missing} transactions executed at slot {slot} did not appear \
-                     within {TSS_DRAIN_TIMEOUT:?}"
-                );
-                return;
-            }
+            note_slow_wait(started, &mut noted, || {
+                format!("rows of {missing} transactions executed at slot {slot}")
+            });
             std::thread::sleep(Duration::from_millis(2));
         }
     }
@@ -2004,6 +2087,23 @@ impl Harness {
         self.my_pubkey = self.takeover_identity;
     }
 
+    /// Leader mode: this node gives up the identity that leads the slot (an operator's
+    /// `set-identity` onto another key). Replay and the block creation loop both see the new
+    /// one, the loop the way it does at a window start (`block_creation_loop.rs`, `run_loop`).
+    fn move_leader_identity(&mut self) {
+        let successor = Pubkey::new_from_array([0x5e; 32]);
+        self.my_pubkey = successor;
+        self.drive_leader(move |leader| leader.set_identity(successor));
+    }
+
+    /// Slots whose queued status writes the last crash restart threw away.
+    fn take_crash_lost_slots(&self) -> BTreeSet<Slot> {
+        self.tss_gate
+            .as_ref()
+            .map(TssGate::take_lost_slots)
+            .unwrap_or_default()
+    }
+
     fn freeze_like_replay(&mut self, slot: Slot) {
         self.freeze_for_test(slot);
         let bank = self.bank(slot).unwrap();
@@ -2312,11 +2412,21 @@ impl Harness {
             tracker.wait_for_dependency(work);
             let _ = done_sender.send(());
         });
-        if done_receiver.recv_timeout(TSS_DRAIN_TIMEOUT).is_err() {
-            panic!(
-                "TSS did not drain within {TSS_DRAIN_TIMEOUT:?} (exit flag = {})",
-                self.tss_exit.load(Ordering::Relaxed)
-            );
+        let started = std::time::Instant::now();
+        let mut noted = false;
+        loop {
+            match done_receiver.recv_timeout(TssGate::POLL) {
+                Ok(()) => break,
+                Err(RecvTimeoutError::Timeout) => note_slow_wait(started, &mut noted, || {
+                    format!(
+                        "TSS to drain (exit flag = {})",
+                        self.tss_exit.load(Ordering::Relaxed)
+                    )
+                }),
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("the TSS drain waiter thread died")
+                }
+            }
         }
         // Rooting queued bank notifications; hand them to the real tracker rather than deciding
         // here what a root does to the confirmed bank. Its guards are the thing under test, and
@@ -2371,12 +2481,12 @@ impl Harness {
         gate.set_discard(true);
         gate.set_open(true);
         // The sender's queue plus the one message the gate holds in flight; poll both empty.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let started = std::time::Instant::now();
+        let mut noted = false;
         while !self.tss_sender.sender.is_empty() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the TSS backlog never drained; is the gate thread alive?"
-            );
+            note_slow_wait(started, &mut noted, || {
+                "the TSS backlog to drain through the gate".to_owned()
+            });
             std::thread::sleep(TssGate::POLL);
         }
         std::thread::sleep(TssGate::POLL * 3);
@@ -2804,6 +2914,40 @@ impl Harness {
             .collect()
     }
 
+    /// C1 as a client sees it: an account only a discarded generation at slot 4 or 5 wrote has no
+    /// balance at processed or confirmed commitment, read from whichever bank the commitment
+    /// picks (the slot's replacement or a descendant of it). Since #16508 a discarded
+    /// generation's write cache lives until its bank drops, which an idle pooled scheduler can
+    /// put off by about 190 s; this is what RPC serves in that window.
+    fn rpc_account_leaks(&self) -> (Vec<(&'static str, Pubkey, Slot)>, usize) {
+        let mut leaks = Vec::new();
+        let mut checked = 0;
+        for slot in [ProgramRun::SLOT, ProgramRun::CHILD_SLOT] {
+            let destinations: Vec<Pubkey> = self
+                .discarded_only_signatures(slot)
+                .into_iter()
+                .map(|signature| self.model.destination(signature))
+                .collect();
+            for (name, commitment) in [
+                ("processed", CommitmentConfig::processed()),
+                ("confirmed", CommitmentConfig::confirmed()),
+            ] {
+                let config = RpcContextConfig {
+                    commitment: Some(commitment),
+                    min_context_slot: None,
+                };
+                for destination in &destinations {
+                    checked += 1;
+                    let balance = self.rpc.get_balance(destination, config).unwrap().value;
+                    if balance > 0 {
+                        leaks.push((name, *destination, slot));
+                    }
+                }
+            }
+        }
+        (leaks, checked)
+    }
+
     /// I6 / C8: the commitment cache's processed slot names a bank that exists but is not
     /// frozen, which is what `simulateTransaction` asserts on.
     fn commitment_cache_violation(&self) -> Option<Slot> {
@@ -2925,10 +3069,63 @@ pub enum Op {
     /// Leader mode: votor certifies a parent past this node's window, so the loop aborts the slot
     /// it is producing (`abort_working_bank`) and refuses to start another.
     WindowCertifiedPast,
+    /// A byte the encoding has not given an op yet (see `Op::REPLAY_TABLE`). It never runs.
+    Unassigned,
+    /// Replay mode: the slot roots while TSS is behind, so the rooted slot's history checks wait
+    /// for the next drain. A crash before that loses the writes still queued, the purge an
+    /// UpdateParent restart queued among them: the restart purge's crash leg, which upstream
+    /// accepts (raised in #14432's review; #16227 drains only a graceful exit).
+    RootLagging,
+    /// Leader mode: the loop is handed a window whose ParentReady names a version of the parent
+    /// that replay never froze. `maybe_start_leader` finds the parent's block id differs
+    /// (`ParentBlockIdMismatch`), the loop waits for a bank switch that never comes, and the
+    /// start gives up within its budget (`ReplayIsBehind`) having created nothing.
+    LeaderStartOtherParentVersion,
+    /// Leader mode: an operator moves this node to another identity between slots
+    /// (`set-identity`). The loop picks that up at its next window start, updating its cached
+    /// identity and next leader slot (#16637). From then on this node does not lead the slot,
+    /// so the loop refuses to start one (`LeaderIdentityMismatch`).
+    LeaderSetIdentity,
 }
 
 impl Op {
-    const ALL: [Op; 35] = [
+    /// Replay mode's encoding: byte `b` decodes to `REPLAY_TABLE[b % REPLAY_SLOTS]`, and to
+    /// `Unassigned` past the table's end. **Append only.** Moving or inserting an entry changes
+    /// what every stored input means, which needs a `corpus_format` bump in `targets.toml`; a new
+    /// op takes the next free slot, which only changes the inputs that used that byte.
+    const REPLAY_TABLE: [Op; 27] = [
+        Op::PrefixBatch,
+        Op::GapBatch,
+        Op::Marker,
+        Op::HandleInterrupts,
+        Op::DropSignal,
+        Op::Replay,
+        Op::Recreate,
+        Op::RepairGap,
+        Op::Completion,
+        Op::Freeze,
+        Op::Child,
+        Op::Notarize,
+        Op::Switch,
+        Op::PruneRoot,
+        Op::Root,
+        Op::DrainTss,
+        Op::TssLag,
+        Op::FlushAccounts,
+        Op::QueuedPurge,
+        Op::Restart,
+        Op::CrashRestart,
+        Op::LedgerRoot,
+        Op::AlternateComplete,
+        Op::DeployProgram,
+        Op::InvokeProgram,
+        Op::SetIdentity,
+        Op::RootLagging,
+    ];
+    const REPLAY_SLOTS: usize = 32;
+
+    /// Leader mode's encoding, on the same terms as `REPLAY_TABLE`.
+    const LEADER_TABLE: [Op; 36] = [
         Op::PrefixBatch,
         Op::GapBatch,
         Op::Marker,
@@ -2961,62 +3158,37 @@ impl Op {
         Op::LeaderComplete,
         Op::LeaderAbort,
         Op::Broadcast,
-        Op::SetIdentity,
         Op::LeaderNextSlot,
         Op::WindowCertifiedPast,
+        Op::LeaderStartOtherParentVersion,
+        Op::LeaderSetIdentity,
     ];
+    const LEADER_SLOTS: usize = 44;
 
-    /// Ops only the block creation loop can run. In replay mode every one of them is illegal,
-    /// so the decoder never produces them there.
-    const LEADER_ONLY: [Op; 9] = [
-        Op::LeaderStart,
-        Op::LeaderRecord,
-        Op::LeaderParentReady,
-        Op::LeaderHandover,
-        Op::LeaderComplete,
-        Op::LeaderAbort,
-        Op::Broadcast,
-        Op::LeaderNextSlot,
-        Op::WindowCertifiedPast,
-    ];
-
-    fn is_leader_only(self) -> bool {
-        Self::LEADER_ONLY.contains(&self)
-    }
-
-    /// Ops only a node that is not the slot's leader can run: in leader mode this node already
-    /// holds the identity `SetIdentity` would take over.
-    fn is_replay_only(self) -> bool {
-        self == Op::SetIdentity
-    }
-
-    /// The ops a program in this mode can ever run. Decoding against the mode's alphabet keeps
-    /// the fuzzer from spending a quarter of its bytes on ops that are rejected on sight.
-    fn alphabet(leader: bool) -> &'static [Op] {
-        static LEADER: OnceLock<Vec<Op>> = OnceLock::new();
-        static REPLAY: OnceLock<Vec<Op>> = OnceLock::new();
-        let (alphabet, excluded): (_, fn(Op) -> bool) = if leader {
-            (&LEADER, Op::is_replay_only)
+    /// The ops a program in this mode can run, in encoding order, and the slot count the
+    /// encoding reduces a byte to. Each mode leaves out the ops the other alone can run, so few
+    /// bytes go to ops that would be rejected on sight.
+    fn encoding(leader: bool) -> (&'static [Op], usize) {
+        if leader {
+            (&Self::LEADER_TABLE, Self::LEADER_SLOTS)
         } else {
-            (&REPLAY, Op::is_leader_only)
-        };
-        alphabet
-            .get_or_init(|| Self::ALL.into_iter().filter(|op| !excluded(*op)).collect())
-            .as_slice()
+            (&Self::REPLAY_TABLE, Self::REPLAY_SLOTS)
+        }
     }
 
     fn from_byte(byte: u8, leader: bool) -> Self {
-        let alphabet = Self::alphabet(leader);
-        alphabet[usize::from(byte) % alphabet.len()]
+        let (table, slots) = Self::encoding(leader);
+        table
+            .get(usize::from(byte) % slots)
+            .copied()
+            .unwrap_or(Op::Unassigned)
     }
 
     /// The byte `from_byte` maps back to this op, so a program round-trips through `to_bytes`.
     fn to_byte(self, leader: bool) -> u8 {
-        let index = Self::alphabet(leader)
-            .iter()
-            .position(|op| *op == self)
-            .expect("op is outside this mode's alphabet");
-        u8::try_from(index).expect("the alphabet is far smaller than a byte")
+        let (table, slots) = Self::encoding(leader);
+        let index = table.iter().position(|op| *op == self).unwrap_or(slots - 1);
+        u8::try_from(index).expect("the encoding is far smaller than a byte")
     }
 }
 
@@ -3055,6 +3227,8 @@ impl Program {
         };
         if leader {
             let leads_next_slot = rng.random_bool(0.5);
+            // A window naming a parent version replay never froze: the loop refuses it.
+            keep(&mut rng, 0.1, Op::LeaderStartOtherParentVersion);
             keep(&mut rng, 1.0, Op::LeaderStart);
             keep(&mut rng, 0.8, Op::LeaderRecord);
             keep(&mut rng, 0.4, Op::LeaderRecord);
@@ -3072,11 +3246,18 @@ impl Program {
             } else {
                 keep(&mut rng, 1.0, Op::LeaderAbort);
             }
+            // An operator moves this node off the identity between slots; the loop then refuses
+            // to start slot 5.
+            keep(&mut rng, 0.12, Op::LeaderSetIdentity);
             if leads_next_slot {
                 keep(&mut rng, 0.8, Op::LeaderNextSlot);
                 keep(&mut rng, 0.6, Op::LeaderRecord);
                 keep(&mut rng, 0.2, Op::WindowCertifiedPast);
-                keep(&mut rng, 0.9, Op::LeaderComplete);
+                if rng.random_bool(0.15) {
+                    keep(&mut rng, 1.0, Op::LeaderAbort);
+                } else {
+                    keep(&mut rng, 0.9, Op::LeaderComplete);
+                }
             }
             keep(&mut rng, 0.8, Op::Broadcast);
             keep(&mut rng, 0.7, Op::HandleInterrupts);
@@ -3158,10 +3339,27 @@ impl Program {
             keep(&mut rng, 0.8, Op::Freeze);
             keep(&mut rng, 0.5, Op::Notarize);
         }
-        keep(&mut rng, 0.8, Op::Root);
+        // The restart purge's crash leg: TSS falls behind before the UpdateParent purge is queued
+        // (the lag goes in below, once `keep` is done with `ops`), the slot roots with it still
+        // queued, and the process usually crashes before TSS catches up (see `Op::RootLagging`).
+        let crash_leg = rng.random_bool(0.15);
+        if crash_leg {
+            keep(&mut rng, 1.0, Op::RootLagging);
+            keep(&mut rng, 0.7, Op::CrashRestart);
+            keep(&mut rng, 1.0, Op::DrainTss);
+        } else {
+            keep(&mut rng, 0.8, Op::Root);
+        }
         // A ledger-only root leaves the bank forks root behind, so the restart below makes
         // startup replay advance the root itself (R14).
         keep(&mut rng, 0.3, Op::LedgerRoot);
+        if crash_leg {
+            let lag_at = ops
+                .iter()
+                .position(|op| *op == Op::HandleInterrupts)
+                .unwrap_or(ops.len());
+            ops.insert(lag_at, Op::TssLag);
+        }
         if rng.random_bool(0.3) {
             // A restart, sometimes one that loses the status writes the old process had queued.
             let restart = if rng.random_bool(0.3) {
@@ -3202,7 +3400,7 @@ impl Program {
 
     /// Decodes a program from fuzzer bytes: bit 0 of byte 0 picks the optimistic sibling, bit 1
     /// leader mode, bit 2 (in leader mode) that this node leads slot 5 too; every later byte is
-    /// one op (modulo the mode's op count). An empty input is an empty program.
+    /// one op (see `Op::REPLAY_TABLE` and `Op::LEADER_TABLE`). An empty input is an empty program.
     pub fn from_bytes(bytes: &[u8]) -> Self {
         let mut label = [0; 8];
         for (index, byte) in label.iter_mut().zip(bytes) {
@@ -3329,10 +3527,21 @@ struct ProgramRun<'a> {
     frozen_by_replay: Option<BankId>,
     /// This node took over the identity that leads the slot (`Op::SetIdentity`).
     identity_taken_over: bool,
+    /// The slot rooted while TSS lagged (`Op::RootLagging`); its history checks run once TSS
+    /// has caught up.
+    root_history_pending: bool,
+    /// A crash restart threw away queued status writes for the slot, and the slot is the root
+    /// startup began from, so startup never replays it to write them again.
+    crash_lost_root_history: bool,
+    /// This node moved off the identity that leads the slot (`Op::LeaderSetIdentity`).
+    identity_moved: bool,
     /// Steps at which the footer-hash oracle compared a bank replay froze, and how many of
     /// those were of a slot this node led, where replay itself does not compare.
     footer_checks: usize,
     own_leader_footer_checks: usize,
+    /// Accounts the RPC account oracle read (`Harness::rpc_account_leaks`), so a guard can tell
+    /// whether programs reach it at all.
+    rpc_account_checks: usize,
     #[cfg(test)]
     applied: Vec<Op>,
 }
@@ -3833,6 +4042,7 @@ impl ProgramRun<'_> {
             }
             Op::DrainTss => {
                 self.harness.drain_tss();
+                self.check_pending_root_history("DrainTss");
                 if leader_mode {
                     // Once TSS caught up, rows of a generation the sad handover replaced are gone
                     // (the leader purge names the transactions it recorded, R9 x C4).
@@ -3952,6 +4162,7 @@ impl ProgramRun<'_> {
                 self.restarted = true;
                 self.frozen_by_replay = None;
                 self.check_startup_purge();
+                self.check_pending_root_history("Restart");
             }
             Op::CrashRestart => {
                 // Same preconditions as `Restart`; what differs is that the old process leaves
@@ -3971,7 +4182,18 @@ impl ProgramRun<'_> {
                 self.restarted = true;
                 self.crashed = true;
                 self.frozen_by_replay = None;
+                // Startup begins at the root and never replays it, so whatever status writes the
+                // crash threw away for a rooted slot stay unwritten (and a purge among them stays
+                // undone). Upstream accepts that crash leg (#14432's review, #16227).
+                let root = self.harness.bank_forks.read().unwrap().root();
+                self.crash_lost_root_history =
+                    self.harness.take_crash_lost_slots().contains(&Self::SLOT)
+                        && Self::SLOT <= root;
                 self.check_startup_purge();
+                if self.root_history_pending {
+                    self.harness.drain_tss();
+                }
+                self.check_pending_root_history("CrashRestart");
             }
             Op::LeaderStart => {
                 if !leader_mode || self.leader_started || working_bank.is_some() {
@@ -4163,6 +4385,67 @@ impl ProgramRun<'_> {
                 }
                 self.harness.broadcast();
             }
+            Op::Unassigned => return false,
+            Op::RootLagging => {
+                if leader_mode
+                    || self.rooted
+                    || self.harness.tss_gate_is_open()
+                    || self.frozen_bank().is_none()
+                    || self
+                        .harness
+                        .bank_forks
+                        .read()
+                        .unwrap()
+                        .block_id(slot)
+                        .is_none()
+                {
+                    return false;
+                }
+                self.harness.set_root(slot);
+                self.rooted = true;
+                self.root_history_pending = true;
+            }
+            Op::LeaderStartOtherParentVersion => {
+                if !leader_mode
+                    || self.leader_started
+                    || working_bank.is_some()
+                    || self
+                        .harness
+                        .bank(optimistic)
+                        .is_none_or(|bank| !bank.is_frozen())
+                {
+                    return false;
+                }
+                // A version of the parent replay has not switched to: no bank anywhere has it.
+                let other_version = self.harness.next_block_id();
+                let started = self.harness.drive_leader(move |leader| {
+                    leader.start(slot, optimistic, Some(other_version), true)
+                });
+                if started.is_ok() {
+                    self.findings.push(Finding {
+                        cell: "L1 leader start",
+                        detail: format!(
+                            "the loop started slot {slot} on slot {optimistic} although the \
+                             window names block id {other_version}, a version replay never froze"
+                        ),
+                        known: None,
+                    });
+                    self.leader_started = true;
+                    self.leader_optimistic = Some(Block {
+                        slot: optimistic,
+                        block_id: self.harness.block_id(optimistic),
+                    });
+                }
+            }
+            Op::LeaderSetIdentity => {
+                // The loop reads a new identity at a window start, so not while it holds a
+                // working bank.
+                if !leader_mode || self.identity_moved || working_bank.is_some() {
+                    return false;
+                }
+                self.harness.move_leader_identity();
+                self.identity_moved = true;
+            }
         }
         true
     }
@@ -4238,8 +4521,8 @@ impl ProgramRun<'_> {
     }
 
     /// The known open case a finding about `signature` matches, if any: rows of a generation the
-    /// root prune removed (R5 x C4; fixed by #16167 except after a crash, which programs cannot
-    /// reach), or of a leader bank the loop aborted (R4 x C4).
+    /// root prune removed (R5 x C4; fixed by #16167 except where a crash loses the purge, see
+    /// `crash_lost`), or of a leader bank the loop aborted (R4 x C4).
     fn known_for(&self, signature: Signature) -> Option<&'static str> {
         let generations = self.harness.model.generations.values().flatten();
         let mut pruned = false;
@@ -4271,7 +4554,9 @@ impl ProgramRun<'_> {
                     "{} served {} at slot {} after {what}",
                     violation.query, violation.signature, violation.slot
                 ),
-                known: self.known_for(violation.signature),
+                known: self
+                    .crash_lost(violation.slot)
+                    .or_else(|| self.known_for(violation.signature)),
             });
         }
     }
@@ -4342,6 +4627,18 @@ impl ProgramRun<'_> {
                 });
             }
         }
+        let (account_leaks, account_checks) = self.harness.rpc_account_leaks();
+        self.rpc_account_checks += account_checks;
+        for (commitment, destination, slot) in account_leaks {
+            self.findings.push(Finding {
+                cell: "C1 accounts via RPC",
+                detail: format!(
+                    "{destination}, written only by a discarded generation at slot {slot}, has a \
+                     balance at {commitment} commitment after {what}"
+                ),
+                known: None,
+            });
+        }
         if let Some(stale) = self.harness.commitment_cache_violation() {
             // The case is that a switch replaces the bank in a slot and nothing re-tags the
             // commitment cache, so whatever put the slot there - a notarization, or startup
@@ -4357,6 +4654,20 @@ impl ProgramRun<'_> {
         }
     }
 
+    /// The known case for a history finding at `at` after a crash: the crash threw away queued
+    /// status writes for the startup root, and startup never replays its root to write them.
+    fn crash_lost(&self, at: Slot) -> Option<&'static str> {
+        (self.crash_lost_root_history && at == Self::SLOT).then_some(CRASH_LOST_ROOT_HISTORY)
+    }
+
+    /// Runs the rooted slot's history checks that `Op::RootLagging` deferred, once TSS caught up.
+    fn check_pending_root_history(&mut self, what: &str) {
+        if std::mem::take(&mut self.root_history_pending) {
+            self.check_rooted_history();
+            self.check_confirmed_reads(what);
+        }
+    }
+
     /// I1 and I3 on the history rows and through RPC, once the slot rooted and TSS drained.
     fn check_rooted_history(&mut self) {
         let slot = Self::SLOT;
@@ -4364,14 +4675,16 @@ impl ProgramRun<'_> {
             self.findings.push(Finding {
                 cell: "C4 history rows",
                 detail: format!("{signature} served as finalized at slot {served_slot}"),
-                known: self.known_for(signature),
+                known: self
+                    .crash_lost(served_slot)
+                    .or_else(|| self.known_for(signature)),
             });
         }
         for (signature, at) in self.harness.finalized_completeness_violations() {
             self.findings.push(Finding {
                 cell: "C4 history rows (missing)",
                 detail: format!("rooted {signature} has no row at slot {at}"),
-                known: None,
+                known: self.crash_lost(at),
             });
         }
         let rooted_bank_id = self.harness.bank(slot).map(|bank| bank.bank_id());
@@ -4393,7 +4706,9 @@ impl ProgramRun<'_> {
                     "{} served {} at slot {}",
                     violation.query, violation.signature, violation.slot
                 ),
-                known: self.known_for(violation.signature),
+                known: self
+                    .crash_lost(violation.slot)
+                    .or_else(|| self.known_for(violation.signature)),
             });
         }
         for violation in self.harness.rpc_finalized_completeness_violations() {
@@ -4403,7 +4718,7 @@ impl ProgramRun<'_> {
                     "{} did not serve rooted {} at slot {}",
                     violation.query, violation.signature, violation.slot
                 ),
-                known: None,
+                known: self.crash_lost(violation.slot),
             });
         }
     }
@@ -4411,13 +4726,15 @@ impl ProgramRun<'_> {
     fn finish(self) -> ProgramReport {
         if verbose() {
             eprintln!(
-                "{}: {} ops, {} skipped, {} findings, {} footer checks ({} own-leader)",
+                "{}: {} ops, {} skipped, {} findings, {} footer checks ({} own-leader), {} RPC \
+                 account checks",
                 self.label(),
                 self.program.ops.len(),
                 self.skipped,
                 self.findings.len(),
                 self.footer_checks,
-                self.own_leader_footer_checks
+                self.own_leader_footer_checks,
+                self.rpc_account_checks
             );
         }
         self.harness.shutdown();
@@ -4425,6 +4742,8 @@ impl ProgramRun<'_> {
             findings: self.findings,
             #[cfg(test)]
             own_leader_footer_checks: self.own_leader_footer_checks,
+            #[cfg(test)]
+            rpc_account_checks: self.rpc_account_checks,
             #[cfg(test)]
             skipped: self.skipped,
             #[cfg(test)]
@@ -4445,6 +4764,8 @@ struct ProgramReport {
     findings: Vec<Finding>,
     #[cfg(test)]
     own_leader_footer_checks: usize,
+    #[cfg(test)]
+    rpc_account_checks: usize,
     #[cfg(test)]
     skipped: u32,
     /// The ops that ran, in order (the rest were skipped).
@@ -4496,8 +4817,12 @@ fn run_program_report(program: &Program) -> ProgramReport {
         switched_generations: Vec::new(),
         frozen_by_replay: None,
         identity_taken_over: false,
+        root_history_pending: false,
+        crash_lost_root_history: false,
+        identity_moved: false,
         footer_checks: 0,
         own_leader_footer_checks: 0,
+        rpc_account_checks: 0,
         #[cfg(test)]
         applied: Vec::new(),
     }
@@ -5105,12 +5430,13 @@ mod tests {
     /// `own_leader_replay_freezes_a_footer_its_block_does_not_compute`), and from its
     /// introduction until 2026-11-08 no program reached it, because programs never froze a
     /// block by replaying it. These seeds take over the slot's identity and then replay its
-    /// block to completion. Re-derive them whenever the op alphabet or the generator changes:
+    /// block to completion (re-derived 2026-11-12, 135 seeds in 4000 do). Re-derive them
+    /// whenever the op encoding or the generator changes:
     /// a verbose sweep (`FLH_HARNESS_VERBOSE`) prints "N footer checks (M own-leader)" per
     /// program.
     #[test]
     fn oracles_reach_the_footer_hash_of_own_leader_replays() {
-        for seed in [15, 36, 87] {
+        for seed in [15, 30, 36] {
             let report = run_program_report(&Program::random(seed));
             assert!(
                 report.own_leader_footer_checks > 0,
@@ -5129,8 +5455,10 @@ mod tests {
 
     /// Programs must keep reaching the loop's window paths the fixed tests cover: a second slot
     /// produced within the window and completed, and a slot given up because the cluster
-    /// certified past the window. Re-derive the seeds whenever the op alphabet or the generator
-    /// changes (both happen in about a third of leader programs as of 2026-11-08).
+    /// certified past the window. Also the paths rev 13 added: a start on a parent version replay
+    /// never froze, an identity move between slots, and an abort of slot 5. Re-derive the seeds
+    /// whenever the op encoding or the generator changes (as of 2026-11-12, in 4000 seeds: 113,
+    /// 91 and 26 reach the new ones).
     #[test]
     fn programs_reach_the_loops_window_paths() {
         let ran_then = |applied: &[Op], first: Op, then: Op| {
@@ -5139,6 +5467,37 @@ mod tests {
                 .position(|op| *op == first)
                 .is_some_and(|at| applied[at..].contains(&then))
         };
+        // A seed, the path it must reach, and how to tell from the ops that ran.
+        type PathCheck = (u64, &'static str, fn(&[Op]) -> bool);
+        let new_paths: [PathCheck; 3] = [
+            (22, "start on another parent version", |applied| {
+                applied.contains(&Op::LeaderStartOtherParentVersion)
+            }),
+            (22, "identity move between slots", |applied| {
+                applied.contains(&Op::LeaderSetIdentity)
+            }),
+            (279, "abort of slot 5", |applied| {
+                applied
+                    .iter()
+                    .position(|op| *op == Op::LeaderNextSlot)
+                    .is_some_and(|at| applied[at..].contains(&Op::LeaderAbort))
+            }),
+        ];
+        for (seed, path, reached) in new_paths {
+            let report = run_program_report(&Program::random(seed));
+            assert!(
+                reached(&report.applied),
+                "seed {seed} no longer reaches the {path}"
+            );
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .all(|finding| finding.known.is_some()),
+                "seed {seed}: {:?}",
+                report.findings
+            );
+        }
         for seed in [33, 55] {
             let report = run_program_report(&Program::random(seed));
             assert!(
@@ -5166,17 +5525,37 @@ mod tests {
     /// cache. A classifier keyed on "notarized and then switched" misses it, the finding comes
     /// back unclassified, and the target crashes on a bug we already know about, once per
     /// variant. A fuzzing run was once flooded with crashes that way.
+    ///
+    /// The crash leg of the restart purge is the same kind of case: it is only reachable when
+    /// TSS lags behind a root (`Op::RootLagging`) and the process then crashes, so 11 seeds in
+    /// 4000 reach it. These seeds must come back classified as the crash leg, with nothing left
+    /// unclassified; 400 also serves the stale prefix rows, 594 only misses rows.
     #[test]
     fn known_bug_classifiers_cover_every_path_that_reaches_them() {
+        for seed in [400, 594] {
+            let findings = run_program(&Program::random(seed));
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.known == Some(CRASH_LOST_ROOT_HISTORY)),
+                "seed {seed} no longer reaches the crash leg, so its classifier is unguarded"
+            );
+            let unknown: Vec<String> = findings
+                .iter()
+                .filter(|finding| finding.known.is_none())
+                .map(|finding| format!("[{}] {}", finding.cell, finding.detail))
+                .collect();
+            assert!(unknown.is_empty(), "seed {seed}: {}", unknown.join("; "));
+        }
         // Re-derive these whenever the op alphabet or the generator changes. A seed names a
         // program only through the generator, so adding ops reshuffles what every seed
         // produces. The pair (424, 477) was correct when written and had drifted to producing
         // **zero** findings by 2026-10-27, which the old assertion could not detect because
         // "nothing unclassified" is also true of "nothing at all". The assertion below is what
-        // catches that. 426 and 474 reach the bug through the restart (4 seeds in 3000 do, as
-        // of 2026-11-08); 20 reaches it through a notarization. Narrowing the classifier to
-        // "a notarized generation was switched out" must fail on the first two.
-        for seed in [426, 474, 20] {
+        // catches that. 706, 4215 reach the bug through the restart (rare: 1 seed in 4000,
+        // as of 2026-11-12); 20 reaches it through a notarization. Narrowing the classifier to
+        // "a notarized generation was switched out" must fail on the restart seeds.
+        for seed in [706, 4215, 20] {
             let program = Program::random(seed);
             let findings = run_program(&program);
             let unknown: Vec<String> = findings
@@ -5380,26 +5759,26 @@ mod tests {
     /// completed bank (the harness then read stale history, cache leaks, and a commitment cache
     /// naming the recreated, unfrozen slot 4), and broadcast read a leader slot's block id back
     /// from the blockstore after a root had pruned its fork, so slot 5's header had no parent
-    /// block id. The inputs decode through the op alphabet (corpus format 3), so re-capture or
-    /// drop them when it changes.
+    /// block id. The inputs were captured under corpus format 3 and re-encoded for format 4 (each
+    /// op byte reduced modulo format 3's 34 leader ops, which `Op::LEADER_TABLE` keeps in order).
     #[test]
     fn leader_side_harness_bug_inputs_run_clean() {
         for (case, hex) in [
             (
                 "abort cleared slot 4, accounts cache",
-                "060f12191a131b1d2011ffffffffff1e1e00031f1a1d12050f060f05120e1111",
+                "060f12191a131b1d201111111111111e1e00031f1a1d12050f060f05120e1111",
             ),
             (
                 "broadcast had no block id for slot 4",
-                "06191a1a1b111d202f4944454e111a211212031d1f0303051f060b0e0311",
+                "06191a1a1b111d200d0500010a111a211212031d1f0303051f060b0e0311",
             ),
             (
                 "abort cleared slot 4, history",
-                "06191a121a1b123b1d201a191f03621f0d0f0f130e12",
+                "06191a121a1b12191d201a191f031e1f0d0f0f130e12",
             ),
             (
                 "abort cleared slot 4, commitment cache",
-                "070303190f1a1f121c131d12201f110311e0f91e8184da00f4",
+                "070303190f1a1f121c131d12201f110311140b1e1b1e0e0006",
             ),
         ] {
             let program = Program::from_bytes(&bytes_from_hex(hex));
@@ -5414,6 +5793,81 @@ mod tests {
                 .collect();
             assert!(unknown.is_empty(), "input {case:?}: {}", unknown.join("; "));
         }
+    }
+
+    /// A window naming a version of the parent that replay never froze: `maybe_start_leader`
+    /// finds the block id differs (`ParentBlockIdMismatch`), the loop waits for a switch that
+    /// never comes, and the start gives up (`ReplayIsBehind`) with nothing created at the slot.
+    #[test]
+    fn a_start_on_a_parent_version_replay_never_froze_is_refused() {
+        let mut harness = Harness::new_leader(tr(0) / tr(1) / tr(2));
+        let (slot, parent) = (4, 2);
+        let other_version = harness.next_block_id();
+        let started = harness
+            .drive_leader(move |leader| leader.start(slot, parent, Some(other_version), true));
+        assert!(
+            started.is_err(),
+            "the loop must not start on a parent version replay never froze"
+        );
+        assert!(
+            harness.bank(slot).is_none(),
+            "a refused start created a bank"
+        );
+        harness.shutdown();
+    }
+
+    /// After `set-identity` moves this node off the slot's leader, the loop refuses to start
+    /// the slot (`LeaderIdentityMismatch`), having refreshed its identity the way it does at a
+    /// window start (#16637).
+    #[test]
+    fn after_moving_off_the_leader_identity_the_loop_refuses_the_slot() {
+        let mut harness = Harness::new_leader(tr(0) / tr(1) / tr(2));
+        let (slot, parent) = (4, 2);
+        let parent_block_id = harness.block_id(parent);
+        harness.move_leader_identity();
+        let started = harness
+            .drive_leader(move |leader| leader.start(slot, parent, Some(parent_block_id), true));
+        let err = started.expect_err("the loop must refuse a slot this node no longer leads");
+        assert!(err.contains("not the scheduled leader"), "{err}");
+        assert!(
+            harness.bank(slot).is_none(),
+            "a refused start created a bank"
+        );
+        harness.shutdown();
+    }
+
+    /// The RPC account oracle reads something when a discarded generation exists, and finds
+    /// nothing on this tree: a root on the other sibling prunes the slot's generation, and
+    /// neither processed nor confirmed reads see the account its transfer wrote.
+    #[test]
+    fn rpc_reads_do_not_see_accounts_of_an_abandoned_generation() {
+        let mut harness = Harness::new(tr(0) / tr(1) / tr(2));
+        let slot = 4;
+        let (optimistic_parent, rooted_parent) = (2, 1);
+        harness.insert_block_header(slot, optimistic_parent);
+        harness.insert_transfer_batch(slot, optimistic_parent, FEC_SET_SHREDS);
+        harness.generate_new_bank_forks();
+        assert_eq!(harness.replay(slot).unwrap(), 1);
+        harness.drain_tss();
+        harness.freeze_for_test(slot);
+        harness.set_root(rooted_parent);
+        let (leaks, checked) = harness.rpc_account_leaks();
+        assert!(
+            checked > 0,
+            "the pruned generation's account was never read"
+        );
+        assert!(leaks.is_empty(), "{leaks:?}");
+        harness.shutdown();
+    }
+
+    /// Programs reach the RPC account oracle (about half of them, as of 2026-11-12).
+    #[test]
+    fn programs_reach_the_rpc_account_oracle() {
+        let report = run_program_report(&Program::random(1));
+        assert!(
+            report.rpc_account_checks > 0,
+            "seed 1 no longer gives the RPC account oracle anything to read"
+        );
     }
 
     fn cached_generations_at(harness: &Harness, slot: Slot) -> Vec<BankId> {
