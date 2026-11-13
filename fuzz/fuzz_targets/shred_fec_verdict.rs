@@ -50,7 +50,7 @@ use {
     },
     solana_runtime::bank::Bank,
     solana_sha256_hasher::hashv,
-    std::{cell::Cell, sync::Arc},
+    std::{cell::Cell, collections::BTreeMap, sync::Arc},
 };
 
 /// Gap before the delivery slots, so a parent up to `FIRST_SLOT` back stays above the root.
@@ -224,10 +224,11 @@ fn run(bank: &Arc<Bank>, blockstore: &Blockstore, base: u64, input: &Input) {
 /// V1, V2, V3 for one delivery.
 fn check_verdict(bank: &Bank, slot: u64, canonical: bool, verdict: &Verdict, fault: Fault) {
     if canonical {
+        let checked = !verdict.reached_threshold() || verdict.checks_passed == 1;
         assert!(
-            !verdict.dead && verdict.checks_failed == 0,
-            "V1: a canonical FEC set (fault {fault:?}) failed the checks or killed slot {slot}: \
-             {verdict:?}"
+            !verdict.dead && verdict.checks_failed == 0 && checked,
+            "V1: a canonical FEC set (fault {fault:?}) failed the checks, was not checked once it \
+             reached 32 shreds, or killed slot {slot}: {verdict:?}"
         );
         return;
     }
@@ -778,13 +779,12 @@ fn whole_block(
     let Some(block) = honest_block(entries, slot, input, chained_root, &leader) else {
         return;
     };
-    let mut sets: Vec<Vec<Shred>> = Vec::new();
+    // By FEC index, not adjacency: the legacy builder emits every data shred before any coding.
+    let mut by_set: BTreeMap<u32, Vec<Shred>> = BTreeMap::new();
     for shred in block {
-        match sets.last_mut() {
-            Some(set) if set[0].fec_set_index() == shred.fec_set_index() => set.push(shred),
-            _ => sets.push(vec![shred]),
-        }
+        by_set.entry(shred.fec_set_index()).or_default().push(shred);
     }
+    let mut sets: Vec<Vec<Shred>> = by_set.into_values().collect();
     if sets.is_empty() || sets.iter().any(|set| set.len() != SHREDS_PER_FEC_BLOCK) {
         return;
     }

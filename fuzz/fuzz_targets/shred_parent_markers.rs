@@ -306,13 +306,15 @@ fn block_footer(slot: u64, footer: &Footer) -> BlockComponent {
 }
 
 fn finalization_cert(slot: u64, cert: &Cert) -> Option<BlockFinalizationCert> {
-    let bitmap = vec![0xa5; usize::from(cert.bitmap_len % 32)];
-    let aggregate = |sig: Sig| VotesAggregate::new(compressed(sig), bitmap.clone());
+    // Distinct bitmaps, so forwarding one aggregate's bitmap with the other's signature shows.
+    let len = usize::from(cert.bitmap_len % 32);
     Some(BlockFinalizationCert {
         slot: slot.checked_sub(1 + u64::from(cert.block.back % 16))?,
         block_id: BlockId::from(Hash::new_from_array([cert.block.id; 32])),
-        final_aggregate: aggregate(cert.final_sig),
-        notar_aggregate: cert.notar.then(|| aggregate(cert.notar_sig)),
+        final_aggregate: VotesAggregate::new(compressed(cert.final_sig), vec![0xa5; len]),
+        notar_aggregate: cert
+            .notar
+            .then(|| VotesAggregate::new(compressed(cert.notar_sig), vec![0x5a; len + 1])),
     })
 }
 

@@ -16,13 +16,13 @@ use {
     solana_hash::Hash,
     solana_keypair::{Keypair, Signer},
     solana_ledger::shred::{
-        DATA_SHREDS_PER_FEC_BLOCK, Payload, Shred, ShredFlags,
+        DATA_SHREDS_PER_FEC_BLOCK, Payload, Shred, ShredFlags, ShredId,
         filter::ShredFilterContext,
         layout,
         merkle::{finish_erasure_batch_for_tests, reseal_erasure_batch_for_tests},
     },
     solana_runtime::bank::Bank,
-    std::sync::Arc,
+    std::{collections::HashMap, sync::Arc},
 };
 
 #[derive(Arbitrary, Debug)]
@@ -93,17 +93,52 @@ fn recover_without(
     Some((recovered, recovered_data))
 }
 
-/// 1
+/// 1: with 32 or more shards left, exactly the erased shreds come back, byte for byte; with
+/// fewer, nothing does.
 fn check_fidelity(bank: &Arc<Bank>, base: &[Shred], drop_mask: u64) {
-    let Some((recovered, _)) = recover_without(bank, base, None, drop_mask) else {
+    let (erased, kept): (Vec<_>, Vec<_>) = base
+        .iter()
+        .enumerate()
+        .partition(|(i, _)| drop_mask & (1u64 << (i % 64)) != 0);
+    if erased.is_empty() || kept.is_empty() {
         return;
-    };
-    for payload in &recovered {
-        let id = layout::get_shred_id(payload.as_ref());
-        let original = base.iter().find(|o| Some(o.id()) == id);
+    }
+    let kept: Vec<Shred> = kept.into_iter().map(|(_, s)| s.clone()).collect();
+    let num_kept = kept.len();
+    let mut recovered = Vec::new();
+    let result = recovery_context(bank).recover(kept, &mut recovered, &mut Vec::new());
+    if num_kept < DATA_SHREDS_PER_FEC_BLOCK {
         assert!(
-            original.is_some_and(|o| o.payload().as_ref() == payload.as_ref()),
-            "recovery reconstructed {id:?}, which is not byte-identical to an erased shred",
+            result.is_err() && recovered.is_empty(),
+            "recovery rebuilt {} shreds from {num_kept} of 64 shards",
+            recovered.len(),
+        );
+        return;
+    }
+    assert!(
+        result.is_ok(),
+        "recovery failed on an honest set with {num_kept} of 64 shards"
+    );
+    let expected: HashMap<ShredId, &[u8]> = erased
+        .iter()
+        .map(|(_, s)| (s.id(), s.payload().as_ref()))
+        .collect();
+    let got: HashMap<Option<ShredId>, &[u8]> = recovered
+        .iter()
+        .map(|p| (layout::get_shred_id(p.as_ref()), p.as_ref()))
+        .collect();
+    assert_eq!(got.len(), recovered.len(), "recovery emitted a shred twice");
+    assert_eq!(
+        got.len(),
+        expected.len(),
+        "recovery rebuilt {} shreds, {} were erased",
+        got.len(),
+        expected.len(),
+    );
+    for (id, bytes) in &got {
+        assert!(
+            id.and_then(|id| expected.get(&id)) == Some(bytes),
+            "recovery rebuilt {id:?}, which is not byte-identical to an erased shred",
         );
     }
 }

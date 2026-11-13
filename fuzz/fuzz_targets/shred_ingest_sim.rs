@@ -11,9 +11,9 @@
 //! I7 a Merkle root conflict, or a LAST shred below `received`, is flagged, and the slot is
 //!    then dead unless full.
 //! I8 replay's and RPC's decoders agree wherever both accept the slot.
-//! I10 stored-shred growth is bounded by the action count.
-//! I11 reconstructed shreds are bounded by the insert-call count (failed rebuilds and other
-//!     time or memory blowups are left to libFuzzer's limits).
+//! I10 an insert call stores no more new data shreds than it delivered plus recovered.
+//! I11 an insert call reconstructs at most 32 shreds per erasure set it touched (a rebuild needs
+//!     32 of the 64 shards). Time and memory blowups are left to libFuzzer's limits.
 
 #![no_main]
 
@@ -31,26 +31,17 @@ use {
         blockstore::{Blockstore, CompletedDataSetInfo, PossibleDuplicateShred},
         blockstore_metrics::BlockstoreInsertionMetrics,
         shred::{
-            Shred, ShredFlags, filter::ShredFilterContext, layout,
-            merkle::finish_erasure_batch_for_tests,
+            DATA_SHREDS_PER_FEC_BLOCK, SHREDS_PER_FEC_BLOCK, Shred, ShredFlags,
+            filter::ShredFilterContext, layout, merkle::finish_erasure_batch_for_tests,
         },
     },
     solana_runtime::bank::Bank,
-    std::{cell::Cell, sync::Arc},
+    std::{cell::Cell, collections::BTreeSet, sync::Arc},
 };
 
 const SLOTS_PER_INPUT: u64 = 16;
 const MAX_ACTIONS: usize = 16;
-// Each action inserts at most one FEC set of a two-set block (data indices below 64).
-const MAX_DATA_PER_ACTION: u64 = 64;
-const GROWTH_SLACK: u64 = 64;
-// Each insert call feeds at most one FEC set: 32 data + 32 coding shreds to rebuild.
-const MAX_RECOVERED_PER_INSERT: u64 = 64;
-
-thread_local! {
-    // I11: (reconstructed shreds, insert calls) for this input.
-    static WORK: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
-}
+const MAX_MISSING_PER_SET: usize = SHREDS_PER_FEC_BLOCK - DATA_SHREDS_PER_FEC_BLOCK;
 
 #[derive(Arbitrary, Debug)]
 struct Input {
@@ -118,10 +109,6 @@ fuzz_target!(|input: Input| {
 fn run_sequence(bank: &Arc<Bank>, blockstore: &Blockstore, base: u64, input: &Input) {
     let leader = Keypair::new_from_array(LEADER_SEED);
     let mut pool_off = 0usize;
-
-    // I10 bounds the delta, so a stale window in a reused blockstore cannot false-positive.
-    let received_before = window_received(blockstore, base);
-    WORK.with(|w| w.set((0, 0)));
 
     for action in input.actions.iter().take(MAX_ACTIONS) {
         match action {
@@ -205,36 +192,6 @@ fn run_sequence(bank: &Arc<Bank>, blockstore: &Blockstore, base: u64, input: &In
             }
         }
     }
-
-    // I10
-    let actions = input.actions.len().min(MAX_ACTIONS) as u64;
-    let growth = window_received(blockstore, base).saturating_sub(received_before);
-    let bound = MAX_DATA_PER_ACTION
-        .saturating_mul(actions)
-        .saturating_add(GROWTH_SLACK);
-    assert!(
-        growth <= bound,
-        "asymmetric state growth: {actions} actions added {growth} stored data shreds across the \
-         window (bound {bound})",
-    );
-
-    // I11
-    let (recovered, insert_calls) = WORK.with(Cell::get);
-    let recover_bound = MAX_RECOVERED_PER_INSERT
-        .saturating_mul(insert_calls)
-        .saturating_add(GROWTH_SLACK);
-    assert!(
-        recovered <= recover_bound,
-        "asymmetric recovery work: {insert_calls} insert calls reconstructed {recovered} shreds \
-         (bound {recover_bound})",
-    );
-}
-
-fn window_received(blockstore: &Blockstore, base: u64) -> u64 {
-    (0..SLOTS_PER_INPUT)
-        .filter_map(|off| blockstore.meta(base + off).ok().flatten())
-        .map(|meta| meta.received)
-        .sum()
 }
 
 fn map_slots(base: u64, slot: u8, parent: u8) -> (u64, u64) {
@@ -569,6 +526,17 @@ fn insert<F: Fn(PossibleDuplicateShred)>(
     shreds: Vec<(Shred, bool)>,
     handle: &F,
 ) -> (Vec<CompletedDataSetInfo>, BlockstoreInsertionMetrics) {
+    let slots: BTreeSet<u64> = shreds.iter().map(|(s, _)| s.slot()).collect();
+    let sets: BTreeSet<(u64, u32)> = shreds
+        .iter()
+        .map(|(s, _)| (s.slot(), s.fec_set_index()))
+        .collect();
+    let delivered: BTreeSet<(u64, u32)> = shreds
+        .iter()
+        .filter(|(s, _)| s.is_data())
+        .map(|(s, _)| (s.slot(), s.index()))
+        .collect();
+    let stored_before = stored_data_shreds(blockstore, &slots);
     let mut recovery_ctx = recovery_context(bank);
     let mut metrics = BlockstoreInsertionMetrics::default();
     let completed = blockstore
@@ -580,16 +548,28 @@ fn insert<F: Fn(PossibleDuplicateShred)>(
             &mut metrics,
         )
         .unwrap_or_default();
-    // I11
-    let reconstructed = metrics
-        .num_recovered_data_shreds
-        .saturating_add(metrics.num_recovered_coding_shreds) as u64;
-    WORK.with(|w| {
-        let (recovered, calls) = w.get();
-        w.set((
-            recovered.saturating_add(reconstructed),
-            calls.saturating_add(1),
-        ));
-    });
+    let newly_stored = stored_data_shreds(blockstore, &slots).saturating_sub(stored_before);
+    let recovered_data = metrics.num_recovered_data_shreds;
+    assert!(
+        newly_stored <= delivered.len() + recovered_data,
+        "I10: an insert call stored {newly_stored} new data shreds from {} delivered and \
+         {recovered_data} recovered",
+        delivered.len(),
+    );
+    let reconstructed = recovered_data + metrics.num_recovered_coding_shreds;
+    assert!(
+        reconstructed <= MAX_MISSING_PER_SET * sets.len(),
+        "I11: an insert call touching {} erasure sets reconstructed {reconstructed} shreds",
+        sets.len(),
+    );
     (completed, metrics)
+}
+
+/// Data shreds stored across `slots`, from each slot's shred index.
+fn stored_data_shreds(blockstore: &Blockstore, slots: &BTreeSet<u64>) -> usize {
+    slots
+        .iter()
+        .filter_map(|slot| blockstore.get_index(*slot).ok().flatten())
+        .map(|index| index.data().num_shreds())
+        .sum()
 }
