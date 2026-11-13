@@ -31,7 +31,8 @@ use {
     solana_commitment_config::CommitmentConfig,
     solana_entry::{
         block_component::{
-            BlockComponent, BlockFooterV1, BlockHeaderV1, UpdateParentV1, VersionedBlockMarker,
+            BlockComponent, BlockFooterV1, BlockHeaderV1, UpdateParentV1, VersionedBlockFooter,
+            VersionedBlockMarker,
         },
         entry,
         recorder_message::RecorderMessage,
@@ -290,6 +291,12 @@ const FEC_SET_SHREDS: u32 = 32;
 /// removed stay served. Upstream accepts it (raised in #14432's review; #16227 drains only a
 /// graceful exit).
 const CRASH_LOST_ROOT_HISTORY: &str = "R1 x C4: a crash loses the startup root's queued history";
+
+/// The known case for a footer-hash finding on a slot this node led, once the program gave the
+/// block a footer that does not match it (`Op::CompletionWrongFooter`): replay checks a footer
+/// only when someone else led the slot, and upstream keeps it that way (#14580's review).
+const OWN_LEADER_FOOTER_UNCHECKED: &str =
+    "footer x own leader: replay does not check a footer this node's identity produced";
 
 /// How long a harness wait runs before it says so. Not a deadline: an outcome must not depend on
 /// wall-clock time, and a loaded fleet pod runs the same program tens of times slower than a
@@ -1177,6 +1184,34 @@ impl Harness {
             .unwrap();
         transfer.shred_index = Some(FEC_SET_SHREDS);
         transfer.signature
+    }
+
+    /// `completion` with its footer promising `bank_hash`, which can be a hash its block does not
+    /// compute to. The harness's record of the version's promise follows, as the footer-hash
+    /// oracle reads that record.
+    fn replace_footer_hash(
+        &mut self,
+        slot: Slot,
+        mut completion: Vec<BlockComponent>,
+        location: BlockLocation,
+        bank_hash: Hash,
+    ) -> Vec<BlockComponent> {
+        let index = completion
+            .iter()
+            .position(|component| component.as_marker().is_some_and(|m| m.is_footer()))
+            .expect("a completion carries a footer");
+        let VersionedBlockMarker::V1(marker) = completion[index].as_marker().unwrap();
+        let VersionedBlockFooter::V1(footer) = marker.as_block_footer().unwrap();
+        completion[index] = BlockComponent::new_block_marker(
+            VersionedBlockMarker::from_block_footer(BlockFooterV1 {
+                bank_hash,
+                ..footer.clone()
+            }),
+        );
+        self.model
+            .footer_bank_hash
+            .insert((slot, location), bank_hash);
+        completion
     }
 
     /// After an UpdateParent the entry chain restarts from the new parent's last blockhash, as
@@ -2586,6 +2621,73 @@ impl Harness {
         }))
     }
 
+    /// C5 through RPC: the rooted slot's block time, block height and rewards are the rooted
+    /// generation's. TSS writes them when a generation freezes, keyed by slot alone, so a
+    /// generation that froze and was then replaced leaves its own unless the replacement's freeze
+    /// wrote over them. Generations can differ in all three: the footer sets the clock, and fees
+    /// depend on which transactions ran. A block RPC does not serve is left to the completeness
+    /// oracles.
+    fn rpc_block_meta_violations(&self, slot: Slot) -> (Vec<String>, bool) {
+        let Some(bank) = self.bank(slot).filter(|bank| bank.is_frozen()) else {
+            return (Vec::new(), false);
+        };
+        if !self.blockstore.is_root(slot) {
+            return (Vec::new(), false);
+        }
+        let config = RpcBlockConfig {
+            encoding: None,
+            transaction_details: Some(TransactionDetails::None),
+            rewards: Some(true),
+            commitment: Some(CommitmentConfig::finalized()),
+            max_supported_transaction_version: Some(0),
+        };
+        let Ok(Some(block)) = futures::executor::block_on(
+            self.rpc
+                .get_block(slot, Some(RpcEncodingConfigWrapper::Current(Some(config)))),
+        ) else {
+            return (Vec::new(), false);
+        };
+        let mut violations = Vec::new();
+        let time = bank.clock().unix_timestamp;
+        if block.block_time != Some(time) {
+            violations.push(format!(
+                "slot {slot} block time {:?}, the rooted generation's is {time}",
+                block.block_time
+            ));
+        }
+        if block.block_height != Some(bank.block_height()) {
+            violations.push(format!(
+                "slot {slot} block height {:?}, the rooted generation's is {}",
+                block.block_height,
+                bank.block_height()
+            ));
+        }
+        let rewards = bank.get_rewards_and_num_partitions();
+        let mut expected: Vec<(String, i64)> = if rewards.should_record() {
+            rewards
+                .keyed_rewards
+                .into_iter()
+                .map(|(pubkey, reward)| (pubkey.to_string(), reward.lamports))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut served: Vec<(String, i64)> = block
+            .rewards
+            .unwrap_or_default()
+            .into_iter()
+            .map(|reward| (reward.pubkey, reward.lamports))
+            .collect();
+        expected.sort();
+        served.sort();
+        if served != expected {
+            violations.push(format!(
+                "slot {slot} rewards {served:?}, the rooted generation's are {expected:?}"
+            ));
+        }
+        (violations, true)
+    }
+
     /// I1 through RPC: for every signature the harness ever replayed, each finalized history
     /// query answers with the rooted generation's slot or with nothing, and a finalized block
     /// never lacks status meta.
@@ -3086,6 +3188,11 @@ pub enum Op {
     /// identity and next leader slot (#16637). From then on this node does not lead the slot,
     /// so the loop refuses to start one (`LeaderIdentityMismatch`).
     LeaderSetIdentity,
+    /// Replay mode: the leader's completion of the slot after the marker, with a footer that
+    /// promises a bank hash its block does not compute. Replay kills the slot when someone else
+    /// led it, and so does startup replay, which then discards the slot (R12) if the node
+    /// restarted before replaying it. A slot this node led replays without the check.
+    CompletionWrongFooter,
 }
 
 impl Op {
@@ -3093,7 +3200,7 @@ impl Op {
     /// `Unassigned` past the table's end. **Append only.** Moving or inserting an entry changes
     /// what every stored input means, which needs a `corpus_format` bump in `targets.toml`; a new
     /// op takes the next free slot, which only changes the inputs that used that byte.
-    const REPLAY_TABLE: [Op; 27] = [
+    const REPLAY_TABLE: [Op; 28] = [
         Op::PrefixBatch,
         Op::GapBatch,
         Op::Marker,
@@ -3121,6 +3228,7 @@ impl Op {
         Op::InvokeProgram,
         Op::SetIdentity,
         Op::RootLagging,
+        Op::CompletionWrongFooter,
     ];
     const REPLAY_SLOTS: usize = 32;
 
@@ -3316,7 +3424,20 @@ impl Program {
         keep(&mut rng, 0.6, Op::Replay);
         keep(&mut rng, 0.5, Op::HandleInterrupts);
         keep(&mut rng, 0.8, Op::RepairGap);
-        keep(&mut rng, 0.6, Op::Completion);
+        // A completion whose footer does not match its block. In half of those programs the node
+        // restarts before replaying it, so startup replay fails the slot and discards it (R12),
+        // and a switch to a valid version then puts a new bank there.
+        let wrong_footer = rng.random_bool(0.15);
+        let startup_discard = wrong_footer && rng.random_bool(0.5);
+        if wrong_footer {
+            keep(&mut rng, 1.0, Op::CompletionWrongFooter);
+        } else {
+            keep(&mut rng, 0.6, Op::Completion);
+        }
+        if startup_discard {
+            keep(&mut rng, 1.0, Op::PruneRoot);
+            keep(&mut rng, 1.0, Op::Restart);
+        }
         // A failover onto the slot's leader once its block is in: the block replays as this
         // node's own, with no footer check.
         keep(&mut rng, 0.25, Op::SetIdentity);
@@ -3330,7 +3451,7 @@ impl Program {
         }
         keep(&mut rng, 0.5, Op::Child);
         keep(&mut rng, 0.5, Op::Notarize);
-        if rng.random_bool(0.4) {
+        if startup_discard || rng.random_bool(0.4) {
             // A complete version is what block-id repair delivers; the switch below prefers it.
             keep(&mut rng, 0.5, Op::AlternateComplete);
             keep(&mut rng, 1.0, Op::Switch);
@@ -3535,6 +3656,9 @@ struct ProgramRun<'a> {
     crash_lost_root_history: bool,
     /// This node moved off the identity that leads the slot (`Op::LeaderSetIdentity`).
     identity_moved: bool,
+    /// The slot's completion promises a bank hash its block does not compute
+    /// (`Op::CompletionWrongFooter`).
+    wrong_footer: bool,
     /// Steps at which the footer-hash oracle compared a bank replay froze, and how many of
     /// those were of a slot this node led, where replay itself does not compare.
     footer_checks: usize,
@@ -3542,6 +3666,11 @@ struct ProgramRun<'a> {
     /// Accounts the RPC account oracle read (`Harness::rpc_account_leaks`), so a guard can tell
     /// whether programs reach it at all.
     rpc_account_checks: usize,
+    /// Rooted slots whose block metadata the C5 oracle compared, slots the C6/C7 oracle looked
+    /// at, and generations startup replay discarded (R12), so guards can tell they are reached.
+    block_meta_checks: usize,
+    slot_mark_checks: usize,
+    startup_discards: usize,
     #[cfg(test)]
     applied: Vec<Op>,
 }
@@ -3578,8 +3707,12 @@ impl ProgramRun<'_> {
         self.harness.bank(Self::SLOT)
     }
 
+    /// The slot's bank once it froze into a usable block. A bank replay froze and then failed
+    /// on its footer stays in bank forks with its slot marked dead (`freeze_and_verify_bank_hash`
+    /// freezes before it compares), but no validator votes on it, roots it or builds on it.
     fn frozen_bank(&self) -> Option<Arc<Bank>> {
-        self.bank().filter(|bank| bank.is_frozen())
+        self.bank()
+            .filter(|bank| bank.is_frozen() && !self.harness.blockstore.is_dead(Self::SLOT))
     }
 
     /// Runs `op` if the state allows it. Returns false when it was skipped.
@@ -3732,7 +3865,7 @@ impl ProgramRun<'_> {
                     Err(err) => panic!("unexpected replay error ({}): {err:?}", self.label()),
                 }
                 self.harness.process_replay_result(slot, result);
-                if let Some(bank) = self.bank().filter(|bank| bank.is_frozen()) {
+                if let Some(bank) = self.frozen_bank() {
                     // A real completion froze the bank; the block id votor would attach with
                     // the certificate is assigned here.
                     if bank.block_id().is_none() {
@@ -3778,7 +3911,7 @@ impl ProgramRun<'_> {
                     .insert_shreds(vec![withheld], true)
                     .unwrap();
             }
-            Op::Completion => {
+            Op::Completion | Op::CompletionWrongFooter => {
                 // The footer's hash comes from a shadow bank at the slot, so the completion can
                 // only be built while no live bank occupies it.
                 if leader_mode
@@ -3791,9 +3924,19 @@ impl ProgramRun<'_> {
                     return false;
                 }
                 self.harness.reset_entry_chain(slot, rooted_parent);
-                let completion =
+                let mut completion =
                     self.harness
                         .build_completion(slot, rooted_parent, 1, BlockLocation::Original);
+                if op == Op::CompletionWrongFooter {
+                    let wrong = Hash::new_from_array(self.harness.next_pubkey().to_bytes());
+                    completion = self.harness.replace_footer_hash(
+                        slot,
+                        completion,
+                        BlockLocation::Original,
+                        wrong,
+                    );
+                    self.wrong_footer = true;
+                }
                 self.harness.insert_completion(
                     slot,
                     optimistic,
@@ -4158,10 +4301,14 @@ impl ProgramRun<'_> {
                 if self.restarted || !(self.pruned || self.rooted) {
                     return false;
                 }
+                let dead_before = self.harness.blockstore.is_dead(Self::SLOT);
                 self.harness.restart(/*drained:*/ true);
+                if !dead_before && self.harness.blockstore.is_dead(Self::SLOT) {
+                    self.record_startup_discard();
+                }
                 self.restarted = true;
                 self.frozen_by_replay = None;
-                self.check_startup_purge();
+                self.check_startup_purge(dead_before);
                 self.check_pending_root_history("Restart");
             }
             Op::CrashRestart => {
@@ -4178,7 +4325,11 @@ impl ProgramRun<'_> {
                 if leader_mode || self.restarted || !(self.pruned || self.rooted) {
                     return false;
                 }
+                let dead_before = self.harness.blockstore.is_dead(Self::SLOT);
                 self.harness.restart(/*drained:*/ false);
+                if !dead_before && self.harness.blockstore.is_dead(Self::SLOT) {
+                    self.record_startup_discard();
+                }
                 self.restarted = true;
                 self.crashed = true;
                 self.frozen_by_replay = None;
@@ -4189,7 +4340,7 @@ impl ProgramRun<'_> {
                 self.crash_lost_root_history =
                     self.harness.take_crash_lost_slots().contains(&Self::SLOT)
                         && Self::SLOT <= root;
-                self.check_startup_purge();
+                self.check_startup_purge(dead_before);
                 if self.root_history_pending {
                     self.harness.drain_tss();
                 }
@@ -4450,10 +4601,112 @@ impl ProgramRun<'_> {
         true
     }
 
-    /// Startup replay purges the pre-UpdateParent history of a slot with a marker before it
-    /// exposes the slot (R14 x C4), and does so while waiting for TSS.
-    fn check_startup_purge(&mut self) {
+    /// Startup replay failed the slot and discarded the generation it had built (R12). The model
+    /// records that generation, so the leak oracles know which accounts and signatures only it
+    /// had: it executed the live version's transfers from the marker on, and its bank is the
+    /// generation cached at the slot that the model has not seen yet.
+    fn record_startup_discard(&mut self) {
         let slot = Self::SLOT;
+        let recorded: Vec<BankId> = self
+            .harness
+            .model
+            .generations
+            .get(&slot)
+            .into_iter()
+            .flatten()
+            .map(|generation| generation.bank_id)
+            .collect();
+        let Some(bank_id) = self
+            .harness
+            .cached_generations()
+            .into_iter()
+            .filter(|(_, cached_slot)| *cached_slot == slot)
+            .map(|(bank_id, _)| bank_id)
+            .find(|bank_id| !recorded.contains(bank_id))
+        else {
+            return;
+        };
+        let from = self
+            .harness
+            .blockstore
+            .meta(slot)
+            .unwrap()
+            .map_or(0, |meta| meta.replay_fec_set_index);
+        let signatures = self
+            .harness
+            .model
+            .transfers
+            .get(&slot)
+            .into_iter()
+            .flatten()
+            .filter(|transfer| {
+                transfer.location == BlockLocation::Original
+                    && transfer.shred_index.is_some_and(|index| index >= from)
+            })
+            .map(|transfer| transfer.signature)
+            .collect();
+        self.harness
+            .model
+            .generations
+            .entry(slot)
+            .or_default()
+            .push(Generation {
+                bank_id,
+                signatures,
+            });
+        self.startup_discards += 1;
+    }
+
+    /// C6 and C7 for the bank replay froze at the slot: no dead mark sits on its slot, and the
+    /// blockstore names its block. A switch replaces the slot's block and clears its dead mark;
+    /// a stale mark or a stale block id would be the replaced version's.
+    fn check_slot_marks(&mut self, what: &str) {
+        let slot = Self::SLOT;
+        let Some(bank) = self.harness.bank(slot).filter(|bank| bank.is_frozen()) else {
+            return;
+        };
+        if self.frozen_by_replay != Some(bank.bank_id()) {
+            return;
+        }
+        self.slot_mark_checks += 1;
+        if self.harness.blockstore.is_dead(slot) {
+            self.findings.push(Finding {
+                cell: "C6 dead marks",
+                detail: format!(
+                    "slot {slot}'s live bank froze through replay but the slot is marked dead \
+                     after {what}"
+                ),
+                known: None,
+            });
+        }
+        let stored = self
+            .harness
+            .blockstore
+            .get_block_id(slot, &self.harness.migration_status)
+            .unwrap();
+        let live = bank.block_id().map(|block_id| block_id.to_hash());
+        if stored != live {
+            self.findings.push(Finding {
+                cell: "C7 block id",
+                detail: format!(
+                    "slot {slot}'s live bank has block id {live:?} but the blockstore names \
+                     {stored:?} after {what}"
+                ),
+                known: None,
+            });
+        }
+    }
+
+    /// Startup replay purges the pre-UpdateParent history of a slot with a marker before it
+    /// exposes the slot (R14 x C4), and does so while waiting for TSS. A slot that was dead before
+    /// the restart is not walked at all, so it is neither purged nor exposed: it can never root,
+    /// and finalized reads never serve it. One that startup walks and then fails (R12) was purged
+    /// before startup replayed it, and is checked.
+    fn check_startup_purge(&mut self, dead_before: bool) {
+        let slot = Self::SLOT;
+        if dead_before {
+            return;
+        }
         let Some(meta) = self.harness.blockstore.meta(slot).unwrap() else {
             return;
         };
@@ -4578,7 +4831,8 @@ impl ProgramRun<'_> {
             return;
         }
         self.footer_checks += 1;
-        if *bank.leader_id() == self.harness.my_pubkey {
+        let own_leader = *bank.leader_id() == self.harness.my_pubkey;
+        if own_leader {
             self.own_leader_footer_checks += 1;
         }
         drop(bank);
@@ -4589,7 +4843,7 @@ impl ProgramRun<'_> {
                     "slot {slot} froze as {computed} after {what}, but no version built for it \
                      promised that hash ({expected:?})"
                 ),
-                known: None,
+                known: (own_leader && self.wrong_footer).then_some(OWN_LEADER_FOOTER_UNCHECKED),
             });
         }
     }
@@ -4597,6 +4851,7 @@ impl ProgramRun<'_> {
     /// I6 on the stores that must never show a discarded generation, after every step.
     fn check_in_memory_stores(&mut self, what: &str) {
         self.check_footer_hash(what);
+        self.check_slot_marks(what);
         for slot in [Self::SLOT, Self::CHILD_SLOT] {
             for signature in self.harness.status_cache_leaks(slot) {
                 self.findings.push(Finding {
@@ -4711,6 +4966,15 @@ impl ProgramRun<'_> {
                     .or_else(|| self.known_for(violation.signature)),
             });
         }
+        let (block_meta_violations, compared) = self.harness.rpc_block_meta_violations(slot);
+        self.block_meta_checks += usize::from(compared);
+        for detail in block_meta_violations {
+            self.findings.push(Finding {
+                cell: "C5 block meta",
+                detail,
+                known: self.crash_lost(slot),
+            });
+        }
         for violation in self.harness.rpc_finalized_completeness_violations() {
             self.findings.push(Finding {
                 cell: "RPC finalized (missing)",
@@ -4745,6 +5009,12 @@ impl ProgramRun<'_> {
             #[cfg(test)]
             rpc_account_checks: self.rpc_account_checks,
             #[cfg(test)]
+            block_meta_checks: self.block_meta_checks,
+            #[cfg(test)]
+            slot_mark_checks: self.slot_mark_checks,
+            #[cfg(test)]
+            startup_discards: self.startup_discards,
+            #[cfg(test)]
             skipped: self.skipped,
             #[cfg(test)]
             applied: self.applied,
@@ -4766,6 +5036,12 @@ struct ProgramReport {
     own_leader_footer_checks: usize,
     #[cfg(test)]
     rpc_account_checks: usize,
+    #[cfg(test)]
+    block_meta_checks: usize,
+    #[cfg(test)]
+    slot_mark_checks: usize,
+    #[cfg(test)]
+    startup_discards: usize,
     #[cfg(test)]
     skipped: u32,
     /// The ops that ran, in order (the rest were skipped).
@@ -4820,9 +5096,13 @@ fn run_program_report(program: &Program) -> ProgramReport {
         root_history_pending: false,
         crash_lost_root_history: false,
         identity_moved: false,
+        wrong_footer: false,
         footer_checks: 0,
         own_leader_footer_checks: 0,
         rpc_account_checks: 0,
+        block_meta_checks: 0,
+        slot_mark_checks: 0,
+        startup_discards: 0,
         #[cfg(test)]
         applied: Vec::new(),
     }
@@ -4835,7 +5115,7 @@ fn verbose() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, solana_entry::block_component::VersionedBlockFooter};
+    use super::*;
 
     /// Runs the pruned-prefix sequence: a slot executes a prefix on an optimistic parent, a
     /// competing root prunes that generation, the delayed UpdateParent marker reparents the slot,
@@ -5430,13 +5710,13 @@ mod tests {
     /// `own_leader_replay_freezes_a_footer_its_block_does_not_compute`), and from its
     /// introduction until 2026-11-08 no program reached it, because programs never froze a
     /// block by replaying it. These seeds take over the slot's identity and then replay its
-    /// block to completion (re-derived 2026-11-12, 135 seeds in 4000 do). Re-derive them
+    /// block to completion (re-derived 2026-11-12, 151 seeds in 6000 do). Re-derive them
     /// whenever the op encoding or the generator changes:
     /// a verbose sweep (`FLH_HARNESS_VERBOSE`) prints "N footer checks (M own-leader)" per
     /// program.
     #[test]
     fn oracles_reach_the_footer_hash_of_own_leader_replays() {
-        for seed in [15, 30, 36] {
+        for seed in [65, 119, 304] {
             let report = run_program_report(&Program::random(seed));
             assert!(
                 report.own_leader_footer_checks > 0,
@@ -5528,11 +5808,28 @@ mod tests {
     ///
     /// The crash leg of the restart purge is the same kind of case: it is only reachable when
     /// TSS lags behind a root (`Op::RootLagging`) and the process then crashes, so 11 seeds in
-    /// 4000 reach it. These seeds must come back classified as the crash leg, with nothing left
-    /// unclassified; 400 also serves the stale prefix rows, 594 only misses rows.
+    /// 6000 reach it. These seeds must come back classified as the crash leg, with nothing left
+    /// unclassified; 187 also serves the stale prefix rows, 1149 only misses rows.
     #[test]
     fn known_bug_classifiers_cover_every_path_that_reaches_them() {
-        for seed in [400, 594] {
+        // A wrong footer on a slot this node led replays unchecked, which upstream keeps; the
+        // footer-hash oracle must classify it (24 seeds in 6000 reach it).
+        for seed in [509, 530] {
+            let findings = run_program(&Program::random(seed));
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.known == Some(OWN_LEADER_FOOTER_UNCHECKED)),
+                "seed {seed} no longer replays a wrong footer as its own leader"
+            );
+            let unknown: Vec<String> = findings
+                .iter()
+                .filter(|finding| finding.known.is_none())
+                .map(|finding| format!("[{}] {}", finding.cell, finding.detail))
+                .collect();
+            assert!(unknown.is_empty(), "seed {seed}: {}", unknown.join("; "));
+        }
+        for seed in [187, 1149] {
             let findings = run_program(&Program::random(seed));
             assert!(
                 findings
@@ -5552,10 +5849,10 @@ mod tests {
         // produces. The pair (424, 477) was correct when written and had drifted to producing
         // **zero** findings by 2026-10-27, which the old assertion could not detect because
         // "nothing unclassified" is also true of "nothing at all". The assertion below is what
-        // catches that. 706, 4215 reach the bug through the restart (rare: 1 seed in 4000,
-        // as of 2026-11-12); 20 reaches it through a notarization. Narrowing the classifier to
+        // catches that. 1442, 2962 reach the bug through the restart (rare: 4 seeds in 6000,
+        // as of 2026-11-12); 45 reaches it through a notarization. Narrowing the classifier to
         // "a notarized generation was switched out" must fail on the restart seeds.
-        for seed in [706, 4215, 20] {
+        for seed in [1442, 2962, 45] {
             let program = Program::random(seed);
             let findings = run_program(&program);
             let unknown: Vec<String> = findings
@@ -5860,14 +6157,49 @@ mod tests {
         harness.shutdown();
     }
 
-    /// Programs reach the RPC account oracle (about half of them, as of 2026-11-12).
+    /// Programs reach the oracles rev 13 and rev 14 added, and the startup discard (R12): the RPC
+    /// account reads (about half of all programs), the C5 block metadata of a rooted slot (one in
+    /// seven), the C6/C7 marks of a slot replay froze (one in ten), a slot startup replay fails
+    /// and discards (about 3 in 100), and a wrong footer replay kills with nothing left
+    /// unclassified. Re-derive the seeds whenever the generator changes.
     #[test]
-    fn programs_reach_the_rpc_account_oracle() {
-        let report = run_program_report(&Program::random(1));
-        assert!(
-            report.rpc_account_checks > 0,
-            "seed 1 no longer gives the RPC account oracle anything to read"
-        );
+    fn programs_reach_the_new_oracles_and_the_startup_discard() {
+        // A seed, what it must reach, and how to tell from its report.
+        type ReachCheck = (u64, &'static str, fn(&ProgramReport) -> bool);
+        let checks: [ReachCheck; 6] = [
+            (84, "the RPC account oracle", |report| {
+                report.rpc_account_checks > 0
+            }),
+            (2, "the C5 block metadata oracle in leader mode", |report| {
+                report.block_meta_checks > 0
+            }),
+            (4, "the C5 block metadata oracle", |report| {
+                report.block_meta_checks > 0
+            }),
+            (4, "the C6/C7 slot marks oracle", |report| {
+                report.slot_mark_checks > 0
+            }),
+            (95, "a startup discard (R12)", |report| {
+                report.startup_discards > 0
+            }),
+            // Replay freezes the bank, finds the footer wrong and marks the slot dead; the dead
+            // bank stays in bank forks and must not count as the slot's block.
+            (16, "a wrong footer that replay kills", |report| {
+                report.applied.contains(&Op::CompletionWrongFooter)
+            }),
+        ];
+        for (seed, what, reached) in checks {
+            let report = run_program_report(&Program::random(seed));
+            assert!(reached(&report), "seed {seed} no longer reaches {what}");
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .all(|finding| finding.known.is_some()),
+                "seed {seed}: {:?}",
+                report.findings
+            );
+        }
     }
 
     fn cached_generations_at(harness: &Harness, slot: Slot) -> Vec<BankId> {
@@ -5876,34 +6208,6 @@ mod tests {
             .into_iter()
             .filter_map(|(bank_id, cached_slot)| (cached_slot == slot).then_some(bank_id))
             .collect()
-    }
-
-    /// `completion` with its footer promising `bank_hash`, a hash its block does not compute to.
-    /// The harness's record of the promise is updated with it, as the oracle reads that record.
-    fn with_footer_hash(
-        harness: &mut Harness,
-        slot: Slot,
-        mut completion: Vec<BlockComponent>,
-        location: BlockLocation,
-        bank_hash: Hash,
-    ) -> Vec<BlockComponent> {
-        let index = completion
-            .iter()
-            .position(|component| component.as_marker().is_some_and(|m| m.is_footer()))
-            .expect("a completion carries a footer");
-        let VersionedBlockMarker::V1(marker) = completion[index].as_marker().unwrap();
-        let VersionedBlockFooter::V1(footer) = marker.as_block_footer().unwrap();
-        completion[index] = BlockComponent::new_block_marker(
-            VersionedBlockMarker::from_block_footer(BlockFooterV1 {
-                bank_hash,
-                ..footer.clone()
-            }),
-        );
-        harness
-            .model
-            .footer_bank_hash
-            .insert((slot, location), bank_hash);
-        completion
     }
 
     /// Replay checks a completed block against its footer only when someone else led the slot
@@ -5922,13 +6226,8 @@ mod tests {
             harness.insert_block_header(slot, parent);
             let completion = harness.build_completion(slot, parent, 1, BlockLocation::Original);
             let promised = Hash::new_unique();
-            let completion = with_footer_hash(
-                &mut harness,
-                slot,
-                completion,
-                BlockLocation::Original,
-                promised,
-            );
+            let completion =
+                harness.replace_footer_hash(slot, completion, BlockLocation::Original, promised);
             harness.insert_completion(
                 slot,
                 parent,
@@ -6203,13 +6502,8 @@ mod tests {
         };
         let completion_b = harness.build_completion(slot, parent, 1, location_b);
         let switched_in = harness.model.transfers[&slot].last().unwrap().signature;
-        let completion_b = with_footer_hash(
-            &mut harness,
-            slot,
-            completion_b,
-            location_b,
-            Hash::new_unique(),
-        );
+        let completion_b =
+            harness.replace_footer_hash(slot, completion_b, location_b, Hash::new_unique());
 
         harness.insert_block_header(slot, parent);
         harness.insert_transfer_batch(slot, parent, FEC_SET_SHREDS);
