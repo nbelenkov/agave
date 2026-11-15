@@ -80,7 +80,7 @@ impl AggregateCommitmentService {
     }
 }
 
-fn update_commitment_cache(
+pub(crate) fn update_commitment_cache(
     block_commitment_cache: &RwLock<BlockCommitmentCache>,
     update_type: CommitmentType,
     slot: Slot,

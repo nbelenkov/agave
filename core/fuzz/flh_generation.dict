@@ -1,0 +1,42 @@
+# libFuzzer dictionary for agave-flh-generation: op sequences the generator builds
+# (`Program::random`), as the bytes `Program::from_bytes` decodes them. An input is a header
+# byte and up to 32 op bytes; these let a mutation insert a whole step of a discard path at
+# once. Each name is the mode and the ops, which `dictionary_entries_decode_to_their_names`
+# checks against `Op::REPLAY_TABLE` and `Op::LEADER_TABLE`.
+
+# the UpdateParent restart: the marker, then replay handles it
+replay__marker__handle_interrupts="\x02\x03"
+# a complete version stored while the slot is cleared
+replay__handle_interrupts__alternate_complete="\x03\x16"
+# replay recreates the slot's bank and freezes it
+replay__recreate__replay__freeze="\x06\x05\x09"
+# repair fills the gap, then the leader completes the slot
+replay__repair_gap__completion="\x07\x08"
+# a child on the slot, then the slot notarized
+replay__child__notarize="\x0a\x0b"
+# a switch after notarizing, and the replacement notarized
+replay__notarize__switch__recreate__replay__notarize="\x0b\x0c\x06\x05\x0b"
+# the slot frozen and rooted
+replay__freeze__root="\x09\x0e"
+# the restart purge's crash leg
+replay__root_lagging__crash_restart__drain_tss="\x1a\x14\x0f"
+# a wrong footer that startup replay fails and discards
+replay__completion_wrong_footer__prune_root__restart="\x1b\x0d\x13"
+# a program deployed at the slot, then invoked
+replay__deploy_program__freeze__invoke_program="\x17\x09\x18"
+# a failover onto the slot's leader before it replays
+replay__set_identity__recreate__replay="\x19\x06\x05"
+# a prefix replayed, its fork pruned, then the marker
+replay__prefix_batch__replay__prune_root__marker="\x00\x05\x0d\x02"
+# a ledger-only root that startup replay catches up to
+replay__ledger_root__restart="\x15\x13"
+# the leader's slot from start to completion
+leader__leader_start__leader_record__leader_parent_ready__leader_complete="\x19\x1a\x1b\x1d"
+# a sad handover mid-slot
+leader__leader_start__leader_record__leader_handover__leader_complete="\x19\x1a\x1c\x1d"
+# the next slot of the window
+leader__leader_next_slot__leader_record__leader_complete="\x20\x1a\x1d"
+# the cluster moves past the window first
+leader__leader_start__leader_record__window_certified_past="\x19\x1a\x21"
+# a completed slot broadcast and replayed
+leader__leader_complete__broadcast__handle_interrupts__replay="\x1d\x1f\x03\x05"

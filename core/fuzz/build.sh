@@ -6,7 +6,8 @@
 # It builds with the tree's pinned nightly, not the build image's: the workspace's rust-version is
 # newer than the image's nightly, which the default cargo-fuzz recipe would use. The fuzz crate is a
 # member of the dev-bins workspace, so the output directory is set with --target-dir rather than
-# assumed to be under core/fuzz. It also ships the few committed seeds in seeds/ (see the end).
+# assumed to be under core/fuzz. It also ships the few committed seeds in seeds/ and the dictionary
+# (see the end).
 set -euo pipefail
 
 : "${SRC:?SRC must name the checkout}"
@@ -60,3 +61,7 @@ strip --strip-debug "$OUT/bin/$target_name" "$OUT/bin/${target_name}_cov"
 # second under ASan, before it fuzzes. `FLH_CORPUS_SEEDS=16` with `write_seed_corpus` makes them.
 mkdir -p "$OUT/corpus/$target_name"
 cp "$SRC/$fuzz_dir/seeds/"* "$OUT/corpus/$target_name/"
+
+# The dictionary of op sequences; targets.toml names it relative to the directory holding OUT.
+mkdir -p "$OUT/dict"
+cp "$SRC/$fuzz_dir/flh_generation.dict" "$OUT/dict/$target_name.dict"

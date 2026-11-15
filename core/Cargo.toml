@@ -19,6 +19,7 @@ rustdoc-args = ["--cfg=docsrs"]
 agave-unstable-api = []
 dev-context-only-utils = [
     "agave-banking-stage-ingress-types/dev-context-only-utils",
+    "dep:serde_json",
     "dep:solana-commitment-config",
     "dep:solana-loader-v3-interface",
     "dep:solana-program-binaries",
@@ -95,6 +96,7 @@ rts-alloc = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
+serde_json = { workspace = true, optional = true }
 shaq = { workspace = true }
 signal-hook = { workspace = true }
 slab = { workspace = true }

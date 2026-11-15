@@ -29,6 +29,10 @@ rss_limit_mb = 3072
 # op no longer reshuffles every input; format 3's inputs decode to other programs under it.
 corpus_format = 4
 owner        = "security"
+# Op sequences the generator builds, so a mutation can insert a whole step of a discard path
+# (`flh_generation.dict`; build.sh copies it into the bundle layout, which a script build's paths
+# are relative to).
+dictionary   = "out/dict/agave-flh-generation.dict"
 # The coverage figure counts only the code the discard paths run through, matched as path
 # substrings. Unscoped, every line linked into the binary counts, and the figure hides where
 # programs stop reaching. The harness itself (replay_stage/generation_harness.rs,

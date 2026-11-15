@@ -25,7 +25,7 @@ use {
     },
     crossbeam_channel::{RecvTimeoutError, bounded},
     rand::{Rng, SeedableRng, rngs::StdRng},
-    solana_account::AccountSharedData,
+    solana_account::{AccountSharedData, ReadableAccount},
     solana_accounts_db::accounts_db::{ACCOUNTS_DB_CONFIG_FOR_TESTING, AccountsDbConfig},
     solana_bls_signatures::{BLS_SIGNATURE_AFFINE_SIZE, Signature as BLSSignature},
     solana_commitment_config::CommitmentConfig,
@@ -37,7 +37,7 @@ use {
         entry,
         recorder_message::RecorderMessage,
     },
-    solana_epoch_schedule::EpochSchedule,
+    solana_epoch_schedule::{EpochSchedule, MINIMUM_SLOTS_PER_EPOCH},
     solana_hash::Hash,
     solana_instruction::Instruction,
     solana_keypair::Keypair,
@@ -66,12 +66,18 @@ use {
         },
         rpc::JsonRpcRequestProcessor,
         rpc_pubsub_service::PubSubConfig,
-        rpc_subscriptions::{RpcNotificationConfig, RpcSubscriptions},
+        rpc_subscription_tracker::{
+            AccountSubscriptionParams, SubscriptionId, SubscriptionParams, SubscriptionToken,
+        },
+        rpc_subscriptions::{RpcNotification, RpcNotificationConfig, RpcSubscriptions},
         transaction_status_service::{TransactionStatusService, TransactionStatusServiceConfig},
     },
-    solana_rpc_client_api::config::{
-        RpcBlockConfig, RpcContextConfig, RpcEncodingConfigWrapper, RpcSignatureStatusConfig,
-        RpcTransactionConfig,
+    solana_rpc_client_api::{
+        config::{
+            RpcBlockConfig, RpcContextConfig, RpcEncodingConfigWrapper, RpcSignatureStatusConfig,
+            RpcTransactionConfig,
+        },
+        response::{Response, UiAccount, UiAccountEncoding},
     },
     solana_runtime::{
         accounts_background_service::{PrunedBanksRequestHandler, SendDroppedBankCallback},
@@ -105,7 +111,7 @@ use {
     solana_unified_scheduler_pool::DefaultSchedulerPool,
     std::{
         cell::Cell,
-        collections::{BTreeMap, BTreeSet},
+        collections::{BTreeMap, BTreeSet, HashMap},
         num::NonZeroUsize,
         sync::{
             Arc, Condvar, Mutex, OnceLock, RwLock,
@@ -135,6 +141,41 @@ fn harness_ledger_path() -> std::path::PathBuf {
     ))
 }
 
+/// The shreds `Blockstore::add_tree` writes for `tree`, slot by slot, made once per process and
+/// tree. Signing and erasure-coding them cost every program about 20 ms; inserting the same shreds
+/// into each fresh blockstore gives it the same slots. They come from a throwaway blockstore, so
+/// they are exactly what `add_tree` writes.
+fn fixture_tree_shreds(tree: &Tree<Slot>) -> Vec<Vec<Shred>> {
+    // A tree's slots in walk order, and their shreds slot by slot.
+    type Cache = Mutex<HashMap<Vec<Slot>, Vec<Vec<Shred>>>>;
+    static CACHE: std::sync::LazyLock<Cache> = std::sync::LazyLock::new(Cache::default);
+    let mut slots = Vec::new();
+    let mut walk = TreeWalk::from(tree.clone());
+    while let Some(visit) = walk.get() {
+        slots.push(*visit.node().data());
+        walk.forward();
+    }
+    CACHE
+        .lock()
+        .unwrap()
+        .entry(slots.clone())
+        .or_insert_with(|| {
+            let ledger_path = harness_ledger_path();
+            let template = Blockstore::open(&ledger_path).unwrap();
+            template.add_tree(tree.clone(), false, true, 2, Hash::default());
+            let shreds = slots
+                .iter()
+                .map(|slot| template.get_data_shreds_for_slot(*slot, 0).unwrap())
+                .collect();
+            drop(template);
+            if let Err(err) = std::fs::remove_dir_all(&ledger_path) {
+                warn!("could not remove the fixture template ledger {ledger_path:?}: {err}");
+            }
+            shreds
+        })
+        .clone()
+}
+
 /// What every harness starts from: the slots of a tree frozen with block ids, slot 0 the root,
 /// and one staked validator whose funded node key pays for the program's transactions.
 struct FixtureForks {
@@ -156,7 +197,11 @@ fn fixture_forks(tree: Tree<Slot>) -> FixtureForks {
         mint_keypair,
         ..
     } = create_genesis_config_with_tower_vote_accounts(1_000_000_000, &[&validator], vec![10_000]);
-    genesis_config.epoch_schedule = EpochSchedule::without_warmup();
+    // The shortest epoch there is. Every slot a program touches is in epoch 0, and the harness
+    // replaces the leader schedule with a fixed one; at the default 432,000 slots, computing the
+    // schedule it throws away cost each `LeaderScheduleCache` about 8 ms, twice per program.
+    genesis_config.epoch_schedule =
+        EpochSchedule::custom(MINIMUM_SLOTS_PER_EPOCH, MINIMUM_SLOTS_PER_EPOCH, false);
     genesis_config.poh_config.hashes_per_tick = Some(4);
     let bank_test_config = BankTestConfig {
         accounts_db_config: AccountsDbConfig {
@@ -197,7 +242,9 @@ fn fixture_forks(tree: Tree<Slot>) -> FixtureForks {
 
     let progress = ReplayStage::initialize_progress(&bank_forks);
     let blockstore = Blockstore::open(&ledger_path).unwrap();
-    blockstore.add_tree(tree, false, true, 2, Hash::default());
+    for shreds in fixture_tree_shreds(&tree) {
+        blockstore.insert_shreds(shreds, false).unwrap();
+    }
     FixtureForks {
         bank_forks,
         progress,
@@ -291,6 +338,16 @@ const FEC_SET_SHREDS: u32 = 32;
 /// removed stay served. Upstream accepts it (raised in #14432's review; #16227 drains only a
 /// graceful exit).
 const CRASH_LOST_ROOT_HISTORY: &str = "R1 x C4: a crash loses the startup root's queued history";
+
+/// The known case for a pubsub finding (C11): an account subscription remembers only the slot
+/// its account was last written at (`filter_account_result`), so once it was sent a slot's
+/// contents, a replacement generation's write at the same slot number, or the rest of a
+/// generation that was still replaying, is never sent. Open upstream as #16357, which a
+/// maintainer reproduced on master; the proposed fix invalidates discarded slots for processed
+/// account subscriptions.
+const SUBSCRIPTION_SLOT_DEDUPE: &str = "R3 x C11: account notifications are deduplicated by slot \
+                                        (#16357), so a subscriber keeps what it was sent for a \
+                                        slot's discarded or unfinished contents";
 
 /// The known case for a footer-hash finding on a slot this node led, once the program gave the
 /// block a footer that does not match it (`Op::CompletionWrongFooter`): replay checks a footer
@@ -471,11 +528,20 @@ struct TssGate {
     discard: Arc<AtomicBool>,
     /// Slots the discarded messages were for, until `take_lost_slots` reads them.
     lost_slots: Arc<Mutex<BTreeSet<Slot>>>,
+    /// How many barriers (`TssGate::BARRIER_SLOT`) have come out of the gate.
+    barriers: Arc<(Mutex<u64>, Condvar)>,
+    /// Dropped by `stop` to wake the thread at once. Waiting out a receive timeout instead cost
+    /// every program about 20 ms of teardown on the fuzz path.
+    stop: Option<Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl TssGate {
     const POLL: Duration = Duration::from_millis(20);
+    /// `Rooted` for this slot is the harness's own barrier, never forwarded; nothing in a
+    /// validator roots it. Messages keep their order through the gate, so once a barrier comes out,
+    /// everything sent before it has been handled.
+    const BARRIER_SLOT: Slot = Slot::MAX;
 
     fn spawn(
         proxy: Receiver<TransactionStatusMessage>,
@@ -485,17 +551,22 @@ impl TssGate {
         let exit = Arc::new(AtomicBool::new(false));
         let discard = Arc::new(AtomicBool::new(false));
         let lost_slots = Arc::new(Mutex::new(BTreeSet::new()));
+        let barriers = Arc::new((Mutex::new(0), Condvar::new()));
+        let (stop, stopped) = bounded::<()>(0);
         let thread = std::thread::spawn({
             let open = open.clone();
             let exit = exit.clone();
             let discard = discard.clone();
             let lost_slots = lost_slots.clone();
+            let barriers = barriers.clone();
             move || {
                 while !exit.load(Ordering::Relaxed) {
-                    let message = match proxy.recv_timeout(Self::POLL) {
-                        Ok(message) => message,
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+                    let message = crossbeam_channel::select! {
+                        recv(proxy) -> message => match message {
+                            Ok(message) => message,
+                            Err(_) => return,
+                        },
+                        recv(stopped) -> _ => return,
                     };
                     let (lock, condvar) = &*open;
                     let mut is_open = lock.lock().unwrap();
@@ -503,6 +574,15 @@ impl TssGate {
                         is_open = condvar.wait_timeout(is_open, Self::POLL).unwrap().0;
                     }
                     drop(is_open);
+                    if let TransactionStatusMessage::Rooted {
+                        slot: Self::BARRIER_SLOT,
+                    } = message
+                    {
+                        let (count, condvar) = &*barriers;
+                        *count.lock().unwrap() += 1;
+                        condvar.notify_all();
+                        continue;
+                    }
                     let message = if discard.load(Ordering::Relaxed) {
                         if let Some(slot) = Self::message_slot(&message) {
                             lost_slots.lock().unwrap().insert(slot);
@@ -525,6 +605,8 @@ impl TssGate {
             exit,
             discard,
             lost_slots,
+            barriers,
+            stop: Some(stop),
             thread: Some(thread),
         }
     }
@@ -571,6 +653,26 @@ impl TssGate {
         }
     }
 
+    /// Sends a barrier through the gate and waits for it to come out the other side.
+    fn pass_barrier(&self, sender: &Sender<TransactionStatusMessage>) {
+        let (count, condvar) = &*self.barriers;
+        let mut passed = count.lock().unwrap();
+        let target = *passed + 1;
+        sender
+            .send(TransactionStatusMessage::Rooted {
+                slot: Self::BARRIER_SLOT,
+            })
+            .unwrap();
+        let started = std::time::Instant::now();
+        let mut noted = false;
+        while *passed < target {
+            passed = condvar.wait_timeout(passed, Self::POLL).unwrap().0;
+            note_slow_wait(started, &mut noted, || {
+                "a barrier to pass the TSS gate".to_owned()
+            });
+        }
+    }
+
     fn set_discard(&self, discard: bool) {
         self.discard.store(discard, Ordering::Relaxed);
     }
@@ -587,6 +689,7 @@ impl TssGate {
 
     fn stop(mut self) {
         self.exit.store(true, Ordering::Relaxed);
+        drop(self.stop.take());
         self.set_open(true);
         if let Some(thread) = self.thread.take() {
             thread.join().unwrap();
@@ -613,6 +716,70 @@ struct BroadcastState {
     next_index: u32,
 }
 
+/// The commitment levels a pubsub subscription can ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Commitment {
+    Processed,
+    Confirmed,
+    Finalized,
+}
+
+impl Commitment {
+    const ALL: [Self; 3] = [Self::Processed, Self::Confirmed, Self::Finalized];
+
+    fn config(self) -> CommitmentConfig {
+        match self {
+            Self::Processed => CommitmentConfig::processed(),
+            Self::Confirmed => CommitmentConfig::confirmed(),
+            Self::Finalized => CommitmentConfig::finalized(),
+        }
+    }
+}
+
+/// An account as a pubsub subscriber holds it: what it was last sent, or read when it
+/// subscribed. `modified_slot` is the slot the value was last written at, which is all pubsub
+/// compares to decide whether a later round has news for the subscriber
+/// (`filter_account_result`). `bank_id` is the generation at that slot the value came from, when
+/// the harness can name it, and `settled` whether that generation had frozen, so its value at that
+/// slot could no longer change.
+#[derive(Debug, Clone)]
+struct AccountView {
+    lamports: u64,
+    owner: Pubkey,
+    data: Vec<u8>,
+    modified_slot: Slot,
+    bank_id: Option<BankId>,
+    settled: bool,
+}
+
+impl AccountView {
+    fn same_value(&self, other: &Self) -> bool {
+        (self.lamports, self.owner, &self.data) == (other.lamports, other.owner, &other.data)
+    }
+}
+
+struct AccountSubscription {
+    _token: SubscriptionToken,
+    id: SubscriptionId,
+    pubkey: Pubkey,
+    commitment: Commitment,
+    view: Option<AccountView>,
+}
+
+/// A pubsub client (C11): an account subscription per watched account and commitment level, and
+/// a root subscription the harness's barriers come back on.
+struct PubsubClient {
+    receiver: tokio::sync::broadcast::Receiver<RpcNotification>,
+    _barrier_token: SubscriptionToken,
+    barrier_id: SubscriptionId,
+    next_barrier: Slot,
+    accounts: Vec<AccountSubscription>,
+    /// What subscribers were left holding that their bank does not, since `take_pubsub_findings`
+    /// last ran, and whether it is the slot-keyed dedupe.
+    violations: Vec<(String, bool)>,
+    checks: usize,
+}
+
 struct Harness {
     blockstore: Arc<Blockstore>,
     bank_forks: Arc<RwLock<BankForks>>,
@@ -635,7 +802,10 @@ struct Harness {
     drop_bank_receiver: Receiver<Vec<BankWithScheduler>>,
     /// The real ABS queue: every dropped bank lands here instead of purging inline.
     pruned_banks: PrunedBanksRequestHandler,
-    _votor_commitment_receiver: Receiver<CommitmentAggregationData>,
+    /// Votor's commitment updates: replay's root path sends `Rooted`, the harness's notarize
+    /// stand-in sends `Notarize`, as votor's event handler does. `apply_commitment_updates` is
+    /// the aggregation service that applies them to the commitment cache and notifies RPC pubsub.
+    votor_commitment_receiver: Receiver<CommitmentAggregationData>,
     async_verification_freelist: Vec<AsyncVerificationProgress>,
     block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
     latest_switch_request: LatestSwitchRequest,
@@ -649,9 +819,13 @@ struct Harness {
     /// Highest slot whose generation TSS has seen both frozen and rooted; the finalized gate.
     max_complete_and_rooted_transaction_status_slot: Arc<AtomicU64>,
     optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
-    /// Where `OptimisticallyConfirmedBankTracker` sends its notifications. Nothing reads them;
-    /// the tracker is here for what it does to the confirmed bank, not for its notifications.
+    /// RPC pubsub, with its notifier thread: the commitment updates and the confirmed-bank
+    /// tracker notify it, and `pubsub` reads what it sends.
     rpc_subscriptions: Arc<RpcSubscriptions>,
+    /// The pubsub notifier's own exit flag, so stopping it never touches TSS's.
+    pubsub_exit: Arc<AtomicBool>,
+    /// A pubsub client's account subscriptions and what each has been sent (C11).
+    pubsub: Mutex<Option<PubsubClient>>,
     bank_notification_receiver: BankNotificationReceiver,
     /// Stands in for `votor::root_utils::set_root`, which is `pub(crate)` to votor.
     votor_bank_notification_sender: BankNotificationSender,
@@ -875,12 +1049,12 @@ impl Harness {
             max_complete_transaction_status_slot.clone(),
             max_complete_and_rooted_transaction_status_slot.clone(),
         );
-        // The confirmed-bank tracker needs somewhere to send its notifications. Nothing here
-        // subscribes, and `notification_threads: None` means no notifier thread is spawned, so
-        // this costs a channel: the fuzz path builds a harness per program and may not start
-        // threads or open files per run.
+        // Commitment updates and the confirmed-bank tracker notify pubsub; a client subscribes
+        // through `subscribe_pubsub`. One notifier thread, as the notifications are few and the
+        // fuzz path builds a harness per program; `shutdown` wakes it to stop at once.
+        let pubsub_exit = Arc::new(AtomicBool::new(false));
         let rpc_subscriptions = Arc::new(RpcSubscriptions::new_with_config(
-            tss_exit.clone(),
+            pubsub_exit.clone(),
             max_complete_transaction_status_slot.clone(),
             max_complete_and_rooted_transaction_status_slot.clone(),
             blockstore.clone(),
@@ -888,13 +1062,13 @@ impl Harness {
             block_commitment_cache.clone(),
             optimistically_confirmed_bank.clone(),
             &PubSubConfig {
-                notification_threads: None,
+                notification_threads: NonZeroUsize::new(1),
                 ..PubSubConfig::default_for_tests()
             },
             RpcNotificationConfig::default(),
         ));
 
-        Self {
+        let harness = Self {
             blockstore,
             bank_forks,
             progress,
@@ -907,7 +1081,7 @@ impl Harness {
             bank_forks_context,
             drop_bank_receiver,
             pruned_banks,
-            _votor_commitment_receiver: votor_commitment_receiver,
+            votor_commitment_receiver,
             async_verification_freelist: Vec::new(),
             block_commitment_cache,
             latest_switch_request: LatestSwitchRequest::default(),
@@ -921,6 +1095,8 @@ impl Harness {
             max_complete_and_rooted_transaction_status_slot,
             optimistically_confirmed_bank,
             rpc_subscriptions,
+            pubsub_exit,
+            pubsub: Mutex::new(None),
             bank_notification_receiver,
             votor_bank_notification_sender,
             confirmed_tracker: Mutex::new(ConfirmedBankTrackerState::default()),
@@ -931,7 +1107,9 @@ impl Harness {
             leader,
             bank_forks_commands,
             broadcast: BroadcastState::default(),
-        }
+        };
+        harness.subscribe_pubsub();
+        harness
     }
 
     fn bank(&self, slot: Slot) -> Option<Arc<Bank>> {
@@ -1835,11 +2013,16 @@ impl Harness {
         self.leader_schedule_cache.set_root(&bank);
     }
 
-    /// Stores a complete alternate version of `slot` on `parent_slot`: header, one transfer
-    /// batch, the footer carrying the hash replay will compute, and the alpentick. Block-id
-    /// repair delivers versions like this, and a switch to one revives the slot with a block
-    /// replay can freeze. Returns the version's block id.
-    fn insert_complete_alternate_version(&mut self, slot: Slot, parent_slot: Slot) -> BlockId {
+    /// Stores a complete alternate version of `slot` on `parent_slot`: header, `transfer_batches`
+    /// transfer batches, the footer carrying the hash replay will compute, and the alpentick.
+    /// Block-id repair delivers versions like this, and a switch to one revives the slot with a
+    /// block replay can freeze. Returns the version's block id.
+    fn insert_complete_alternate_version(
+        &mut self,
+        slot: Slot,
+        parent_slot: Slot,
+        transfer_batches: u32,
+    ) -> BlockId {
         assert!(
             self.bank(slot).is_none(),
             "the shadow bank in build_completion would merge into a live bank at slot {slot}"
@@ -1850,7 +2033,7 @@ impl Harness {
         };
         let header = self.header_component(parent_slot);
         self.insert_component_at_location(slot, parent_slot, &header, 0, false, location);
-        let completion = self.build_completion(slot, parent_slot, 1, location);
+        let completion = self.build_completion(slot, parent_slot, transfer_batches, location);
         self.insert_completion(slot, parent_slot, &completion, FEC_SET_SHREDS, location);
         self.blockstore
             .set_double_merkle_root(slot, location, block_id.to_hash())
@@ -1987,7 +2170,10 @@ impl Harness {
             // The notification channel dies with the process it belonged to, so anything the
             // old one queued and never processed is gone, not waiting for the new tracker.
             while self.bank_notification_receiver.try_recv().is_ok() {}
+            while self.votor_commitment_receiver.try_recv().is_ok() {}
         }
+        // A client reconnects and subscribes again.
+        self.subscribe_pubsub();
         self.seed_progress_for_all_banks();
         self.record_startup_generations();
         let root = self.bank_forks.read().unwrap().root();
@@ -2072,7 +2258,14 @@ impl Harness {
     /// `drain_tss`).
     fn notarize(&self, slot: Slot) {
         assert!(self.bank(slot).unwrap().is_frozen());
-        self.block_commitment_cache.write().unwrap().set_slot(slot);
+        // What votor's event handler sends when it notarizes (`event_handler.rs`).
+        commitment::update_commitment_cache(
+            &self.my_pubkey,
+            CommitmentType::Notarize,
+            slot,
+            &self.bank_forks_context.votor_commitment_sender,
+        );
+        self.apply_commitment_updates();
     }
 
     /// Votor asks replay to switch `slot` to the block `block_id` (R3).
@@ -2177,10 +2370,8 @@ impl Harness {
         );
         let bank_id = self.bank(slot).unwrap().bank_id();
         self.model.rooted.insert(slot, bank_id);
-        // The commitment aggregation service publishes the new root to RPC's commitment cache.
-        let mut commitment_cache = self.block_commitment_cache.write().unwrap();
-        commitment_cache.set_root(slot);
-        commitment_cache.set_highest_super_majority_root(slot);
+        // Replay sent the root to the commitment aggregation service once it rooted the slot.
+        self.apply_commitment_updates();
     }
 
     // ---- leader side ----------------------------------------------------------------------
@@ -2198,7 +2389,13 @@ impl Harness {
         let my_pubkey = self.my_pubkey;
         let drop_bank_receiver = &self.drop_bank_receiver;
         std::thread::scope(|scope| {
-            let worker = scope.spawn(move || f(leader));
+            let (done_sender, done) = bounded::<()>(1);
+            let worker = scope.spawn(move || {
+                let result = f(leader);
+                let _ = done_sender.send(());
+                result
+            });
+            let mut finished = false;
             loop {
                 if let Some(command) = receiver.take_set_root_command() {
                     ReplayStage::process_set_root_command(command, context, &my_pubkey, progress);
@@ -2234,16 +2431,27 @@ impl Harness {
                     )
                     .unwrap();
                 }
-                match receiver.receiver().recv_timeout(Duration::from_millis(5)) {
-                    Ok(command) => ReplayStage::process_bank_forks_command(
-                        command, context, progress, freelist,
-                    ),
-                    Err(RecvTimeoutError::Timeout) => {
-                        if worker.is_finished() {
-                            break;
-                        }
+                // Once the step is done, the commands it left are handled and the loop ends. Until
+                // then a command or the step finishing wakes it at once; the timeout only paces
+                // the scan for completed banks above, which nothing signals.
+                if finished {
+                    match receiver.receiver().try_recv() {
+                        Ok(command) => ReplayStage::process_bank_forks_command(
+                            command, context, progress, freelist,
+                        ),
+                        Err(_) => break,
                     }
-                    Err(RecvTimeoutError::Disconnected) => break,
+                    continue;
+                }
+                crossbeam_channel::select! {
+                    recv(receiver.receiver()) -> command => match command {
+                        Ok(command) => ReplayStage::process_bank_forks_command(
+                            command, context, progress, freelist,
+                        ),
+                        Err(_) => break,
+                    },
+                    recv(done) -> _ => finished = true,
+                    default(Duration::from_millis(1)) => {}
                 }
             }
             worker.join().expect("leader step panicked")
@@ -2470,6 +2678,7 @@ impl Harness {
         // dependency work that was just waited for, so draining it here is the same ordering.
         let mut guard = self.confirmed_tracker.lock().unwrap();
         let tracker = &mut *guard;
+        let notified_before = tracker.last_notified_confirmed_slot;
         while let Ok(notification) = self.bank_notification_receiver.try_recv() {
             OptimisticallyConfirmedBankTracker::process_notification(
                 notification,
@@ -2484,6 +2693,12 @@ impl Harness {
                 None,
                 &Some(self.dependency_tracker.clone()),
             );
+        }
+        // The tracker notifies confirmed subscribers as the confirmed bank moves up.
+        let notified = tracker.last_notified_confirmed_slot;
+        drop(guard);
+        if notified > notified_before {
+            self.check_pubsub(&[(Commitment::Confirmed, notified)]);
         }
     }
 
@@ -2515,17 +2730,266 @@ impl Harness {
         };
         gate.set_discard(true);
         gate.set_open(true);
-        // The sender's queue plus the one message the gate holds in flight; poll both empty.
+        // The sender's queue and the one message the gate may hold are all ahead of the barrier.
+        gate.pass_barrier(&self.tss_sender.sender);
+        gate.set_discard(false);
+    }
+
+    // ---- RPC pubsub: what a subscriber sees (C11) ----------------------------------------------
+
+    /// The accounts the client watches: the funded key every transfer pays from, and the clock,
+    /// which every generation writes at its slot with the block time its footer sets. A
+    /// replacement generation writes both at the slot number the discarded one wrote them at.
+    fn watched_accounts(&self) -> [Pubkey; 2] {
+        [self.funded.pubkey(), solana_sdk_ids::sysvar::clock::id()]
+    }
+
+    /// Subscribes a fresh client, as one does after connecting to a (re)started validator, and
+    /// records what each subscriber starts from: the account as its commitment level's bank holds
+    /// it when the subscription takes effect (`initial_last_notified_slot`).
+    fn subscribe_pubsub(&self) {
+        // Whatever the notifier still holds for the old client goes to the old client.
+        let old = self.pubsub.lock().unwrap().take();
+        if let Some(mut old) = old {
+            self.pubsub_barrier(&mut old);
+        }
+        let control = self.rpc_subscriptions.control();
+        let receiver = control.broadcast_receiver();
+        let barrier_token = control.subscribe(SubscriptionParams::Root).unwrap();
+        let mut accounts = Vec::new();
+        for pubkey in self.watched_accounts() {
+            for commitment in Commitment::ALL {
+                let token = control
+                    .subscribe(SubscriptionParams::Account(AccountSubscriptionParams {
+                        pubkey,
+                        encoding: UiAccountEncoding::Base64,
+                        data_slice: None,
+                        commitment: commitment.config(),
+                    }))
+                    .unwrap();
+                accounts.push(AccountSubscription {
+                    id: token.id(),
+                    _token: token,
+                    pubkey,
+                    commitment,
+                    view: None,
+                });
+            }
+        }
+        let mut client = PubsubClient {
+            receiver,
+            barrier_id: barrier_token.id(),
+            _barrier_token: barrier_token,
+            next_barrier: Slot::MAX,
+            accounts,
+            violations: Vec::new(),
+            checks: 0,
+        };
+        // Subscriptions take effect in the notifier's order, so they have once the barrier is back.
+        let sent = self.pubsub_barrier(&mut client);
+        assert!(sent.is_empty(), "pubsub sent {sent:?} before any round");
+        for subscription in &mut client.accounts {
+            subscription.view = self
+                .bank(self.commitment_slot(subscription.commitment))
+                .map(|bank| self.account_view(&bank, &subscription.pubkey));
+        }
+        *self.pubsub.lock().unwrap() = Some(client);
+    }
+
+    /// The bank a subscription at `commitment` is read from as it subscribes: the commitment
+    /// cache's processed slot or root, or the confirmed bank.
+    fn commitment_slot(&self, commitment: Commitment) -> Slot {
+        match commitment {
+            Commitment::Processed => self.block_commitment_cache.read().unwrap().slot(),
+            Commitment::Confirmed => self
+                .optimistically_confirmed_bank
+                .read()
+                .unwrap()
+                .bank
+                .slot(),
+            Commitment::Finalized => self
+                .block_commitment_cache
+                .read()
+                .unwrap()
+                .highest_super_majority_root(),
+        }
+    }
+
+    /// `pubkey` as `bank` holds it, with the slot it was last written at and the generation of
+    /// that slot `bank` descends from. A missing account reads as the empty one at slot 0, as
+    /// pubsub reads it.
+    fn account_view(&self, bank: &Arc<Bank>, pubkey: &Pubkey) -> AccountView {
+        let (account, modified_slot) = bank.get_account_modified_slot(pubkey).unwrap_or_default();
+        let (bank_id, settled) = self.generation_at(bank, modified_slot);
+        AccountView {
+            lamports: account.lamports(),
+            owner: *account.owner(),
+            data: account.data().to_vec(),
+            modified_slot,
+            bank_id,
+            settled,
+        }
+    }
+
+    /// The generation at `slot` that `bank` descends from, and whether it had frozen: `bank` or an
+    /// ancestor it still links to, or, at or below the root, the rooted generation.
+    fn generation_at(&self, bank: &Arc<Bank>, slot: Slot) -> (Option<BankId>, bool) {
+        let mut current = Some(bank.clone());
+        while let Some(ancestor) = current {
+            if ancestor.slot() == slot {
+                return (Some(ancestor.bank_id()), ancestor.is_frozen());
+            }
+            if ancestor.slot() < slot {
+                return (None, false);
+            }
+            current = ancestor.parent();
+        }
+        if slot <= self.bank_forks.read().unwrap().root() {
+            (self.model.rooted.get(&slot).copied(), true)
+        } else {
+            (None, false)
+        }
+    }
+
+    /// Sends a barrier through the pubsub notifier and returns the account notifications that
+    /// came out ahead of it: the subscription, the slot the round was for, and the account sent.
+    fn pubsub_barrier(&self, client: &mut PubsubClient) -> Vec<(SubscriptionId, Slot, UiAccount)> {
+        let marker = client.next_barrier;
+        client.next_barrier -= 1;
+        self.rpc_subscriptions.notify_roots(vec![marker]);
+        let mut sent = Vec::new();
         let started = std::time::Instant::now();
         let mut noted = false;
-        while !self.tss_sender.sender.is_empty() {
-            note_slow_wait(started, &mut noted, || {
-                "the TSS backlog to drain through the gate".to_owned()
-            });
-            std::thread::sleep(TssGate::POLL);
+        loop {
+            let notification = match client.receiver.try_recv() {
+                Ok(notification) => notification,
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    note_slow_wait(started, &mut noted, || "a pubsub barrier".to_owned());
+                    std::thread::sleep(Duration::from_micros(50));
+                    continue;
+                }
+                Err(err) => panic!("the pubsub notification stream failed: {err:?}"),
+            };
+            let json = notification
+                .json
+                .upgrade()
+                .expect("pubsub evicted a notification before the client read it");
+            let mut message: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let result = message["params"]["result"].take();
+            if notification.subscription_id == client.barrier_id {
+                if result.as_u64() == Some(marker) {
+                    return sent;
+                }
+            } else if message["method"] == "accountNotification" {
+                let response: Response<UiAccount> = serde_json::from_value(result).unwrap();
+                sent.push((
+                    notification.subscription_id,
+                    response.context.slot,
+                    response.value,
+                ));
+            }
         }
-        std::thread::sleep(TssGate::POLL * 3);
-        gate.set_discard(false);
+    }
+
+    /// After a round for `targets`, every subscriber at those levels must hold the account as the
+    /// notified bank does (only a frozen bank, which can no longer change, is compared). A
+    /// subscriber left with anything else is a finding. It is the slot-keyed dedupe when the
+    /// bank's value was last written at the slot number the subscriber's was, but by another
+    /// generation, or by one that had not frozen when it was sent.
+    fn check_pubsub(&self, targets: &[(Commitment, Slot)]) {
+        let mut guard = self.pubsub.lock().unwrap();
+        let Some(client) = guard.as_mut() else {
+            return;
+        };
+        for (id, slot, account) in self.pubsub_barrier(client) {
+            let subscription = client
+                .accounts
+                .iter_mut()
+                .find(|subscription| subscription.id == id)
+                .expect("pubsub notified a subscription the client does not hold");
+            let bank = self
+                .bank(slot)
+                .expect("pubsub notified for a slot with no bank");
+            let mut view = self.account_view(&bank, &subscription.pubkey);
+            view.lamports = account.lamports;
+            view.owner = account.owner.parse().unwrap();
+            view.data = account.data.decode().unwrap();
+            subscription.view = Some(view);
+        }
+        let mut violations = Vec::new();
+        for &(commitment, slot) in targets {
+            let Some(bank) = self
+                .bank(slot)
+                .filter(|bank| bank.is_frozen() && !self.blockstore.is_dead(slot))
+            else {
+                continue;
+            };
+            for subscription in &client.accounts {
+                let Some(view) = subscription
+                    .view
+                    .as_ref()
+                    .filter(|_| subscription.commitment == commitment)
+                else {
+                    continue;
+                };
+                client.checks += 1;
+                let expected = self.account_view(&bank, &subscription.pubkey);
+                if view.same_value(&expected) {
+                    continue;
+                }
+                let dedupe = view.modified_slot == expected.modified_slot
+                    && (view.bank_id != expected.bank_id || !view.settled);
+                violations.push((
+                    format!(
+                        "{commitment:?} subscriber to {} holds {} lamports and {} data bytes \
+                         written at slot {} by {:?} (frozen: {}); after the round for slot {slot} \
+                         the bank holds {} lamports and {} data bytes written at slot {} by {:?}",
+                        subscription.pubkey,
+                        view.lamports,
+                        view.data.len(),
+                        view.modified_slot,
+                        view.bank_id,
+                        view.settled,
+                        expected.lamports,
+                        expected.data.len(),
+                        expected.modified_slot,
+                        expected.bank_id
+                    ),
+                    dedupe,
+                ));
+            }
+        }
+        client.violations.extend(violations);
+    }
+
+    /// What `check_pubsub` found since the last call, and how many subscribers it compared.
+    fn take_pubsub_findings(&self) -> (Vec<(String, bool)>, usize) {
+        let mut guard = self.pubsub.lock().unwrap();
+        let Some(client) = guard.as_mut() else {
+            return (Vec::new(), 0);
+        };
+        (
+            std::mem::take(&mut client.violations),
+            std::mem::take(&mut client.checks),
+        )
+    }
+
+    /// The commitment aggregation service (`AggregateCommitmentService`): applies each queued
+    /// update to the commitment cache and notifies pubsub, which a validator does on its own
+    /// thread as updates arrive, then checks what subscribers were sent.
+    fn apply_commitment_updates(&self) {
+        while let Ok(update) = self.votor_commitment_receiver.try_recv() {
+            let slots = crate::commitment_service::update_commitment_cache(
+                &self.block_commitment_cache,
+                update.commitment_type,
+                update.slot,
+            );
+            self.rpc_subscriptions.notify_subscribers(slots);
+            self.check_pubsub(&[
+                (Commitment::Processed, slots.slot),
+                (Commitment::Finalized, slots.highest_super_majority_root),
+            ]);
+        }
     }
 
     // ---- RPC: what a client sees ---------------------------------------------------------------
@@ -3074,6 +3538,11 @@ impl Harness {
         if let Some(tss) = self.tss.take() {
             tss.join().unwrap();
         }
+        // The pubsub notifier checks its exit flag between notifications, and otherwise only every
+        // 100 ms; a notification behind the flag stops it at once.
+        drop(self.pubsub.lock().unwrap().take());
+        self.pubsub_exit.store(true, Ordering::Relaxed);
+        self.rpc_subscriptions.notify_roots(vec![Slot::MAX]);
         // Every harness opens its own ledger directory; a long fuzzing run must not keep them.
         let ledger_path = self.blockstore.ledger_path().clone();
         drop(self);
@@ -3509,10 +3978,31 @@ impl Program {
                 ops.swap(at, at + 1);
             }
         }
+        // Drawn last, so a program that does not take the shape below is what it always was.
+        let optimistic_is_higher = rng.random_bool(0.6);
+        // A switch to a complete version: stored while the marker has the slot cleared, the
+        // first version notarized just before the switch, and the replacement replayed and
+        // notarized at the same slot. That is where pubsub's slot-keyed dedupe shows (#16357).
+        if ops.contains(&Op::Switch) && rng.random_bool(0.3) {
+            if let Some(cleared) = ops.iter().position(|op| *op == Op::HandleInterrupts) {
+                ops.insert(cleared + 1, Op::AlternateComplete);
+            }
+            let switch = ops.iter().position(|op| *op == Op::Switch).unwrap();
+            ops.splice(
+                switch..=switch,
+                [
+                    Op::Notarize,
+                    Op::Switch,
+                    Op::Recreate,
+                    Op::Replay,
+                    Op::Notarize,
+                ],
+            );
+        }
         ops.truncate(Self::MAX_OPS);
         Self {
             label: seed,
-            optimistic_is_higher: rng.random_bool(0.6),
+            optimistic_is_higher,
             leader,
             leads_next_slot: false,
             ops,
@@ -3618,6 +4108,8 @@ struct ProgramRun<'a> {
     completion_inserted: bool,
     child_built: bool,
     switched: bool,
+    /// The switch went to a stored complete version, which replay can finish.
+    switched_to_complete: bool,
     pruned: bool,
     rooted: bool,
     restarted: bool,
@@ -3670,6 +4162,8 @@ struct ProgramRun<'a> {
     /// at, and generations startup replay discarded (R12), so guards can tell they are reached.
     block_meta_checks: usize,
     slot_mark_checks: usize,
+    /// Subscribers the C11 oracle compared with their bank after a notification round.
+    pubsub_checks: usize,
     startup_discards: usize,
     #[cfg(test)]
     applied: Vec<Op>,
@@ -3829,9 +4323,13 @@ impl ProgramRun<'_> {
                 let Some(bank) = self.bank().filter(|bank| !bank.is_frozen()) else {
                     return false;
                 };
-                // The alternate version the switch brought in has no footer in this fixture, so
-                // replaying it would only kill the slot; it is frozen directly instead.
-                if self.switched && self.harness.progress.get(&slot).is_none() {
+                // An alternate version the switch brought in without a stored complete one has no
+                // footer in this fixture, so replaying it would only kill the slot; it is frozen
+                // directly instead. A complete version replays like any block.
+                if self.switched
+                    && !self.switched_to_complete
+                    && self.harness.progress.get(&slot).is_none()
+                {
                     return false;
                 }
                 // Our own leader bank is never replayed from the blockstore; the loop handles it
@@ -4077,6 +4575,7 @@ impl ProgramRun<'_> {
                     .blockstore
                     .set_double_merkle_root(slot, BlockLocation::Original, block_id.to_hash())
                     .unwrap();
+                let complete = self.alternate_complete.is_some();
                 let alternate = match self.alternate_complete.take() {
                     // A complete version is already stored; switching to it revives the slot
                     // with a block replay can finish and freeze.
@@ -4109,6 +4608,7 @@ impl ProgramRun<'_> {
                 );
                 self.switched_generations.push(bank.bank_id());
                 self.switched = true;
+                self.switched_to_complete = complete;
                 drop(bank);
                 if child_before {
                     // The switch clears the generation's descendants with it: their banks,
@@ -4289,9 +4789,12 @@ impl ProgramRun<'_> {
                 {
                     return false;
                 }
-                let block_id = self
-                    .harness
-                    .insert_complete_alternate_version(slot, rooted_parent);
+                // Two transfers where the original's completion has one: a different block
+                // pays differently, so accounts both versions write at the slot (the funded
+                // key) end up different, which is what a pubsub subscriber can tell apart.
+                let block_id =
+                    self.harness
+                        .insert_complete_alternate_version(slot, rooted_parent, 2);
                 self.alternate_complete = Some(block_id);
             }
             Op::Restart => {
@@ -4771,6 +5274,22 @@ impl ProgramRun<'_> {
             self.label()
         );
         self.check_in_memory_stores(what);
+        self.check_subscriptions(what);
+    }
+
+    /// C11: what pubsub subscribers were sent during the step. Commitment updates a step left
+    /// queued (a root the block creation loop's command produced, say) are applied first.
+    fn check_subscriptions(&mut self, what: &str) {
+        self.harness.apply_commitment_updates();
+        let (violations, checks) = self.harness.take_pubsub_findings();
+        self.pubsub_checks += checks;
+        for (detail, dedupe) in violations {
+            self.findings.push(Finding {
+                cell: "C11 subscriptions",
+                detail: format!("{detail}, after {what}"),
+                known: dedupe.then_some(SUBSCRIPTION_SLOT_DEDUPE),
+            });
+        }
     }
 
     /// The known open case a finding about `signature` matches, if any: rows of a generation the
@@ -5013,6 +5532,8 @@ impl ProgramRun<'_> {
             #[cfg(test)]
             slot_mark_checks: self.slot_mark_checks,
             #[cfg(test)]
+            pubsub_checks: self.pubsub_checks,
+            #[cfg(test)]
             startup_discards: self.startup_discards,
             #[cfg(test)]
             skipped: self.skipped,
@@ -5040,6 +5561,8 @@ struct ProgramReport {
     block_meta_checks: usize,
     #[cfg(test)]
     slot_mark_checks: usize,
+    #[cfg(test)]
+    pubsub_checks: usize,
     #[cfg(test)]
     startup_discards: usize,
     #[cfg(test)]
@@ -5075,6 +5598,7 @@ fn run_program_report(program: &Program) -> ProgramReport {
         completion_inserted: false,
         child_built: false,
         switched: false,
+        switched_to_complete: false,
         pruned: false,
         rooted: false,
         restarted: false,
@@ -5102,6 +5626,7 @@ fn run_program_report(program: &Program) -> ProgramReport {
         rpc_account_checks: 0,
         block_meta_checks: 0,
         slot_mark_checks: 0,
+        pubsub_checks: 0,
         startup_discards: 0,
         #[cfg(test)]
         applied: Vec::new(),
@@ -5358,6 +5883,74 @@ mod tests {
     /// switch purges the old version's history synchronously and clears the in-memory stores, but
     /// nothing re-tags the commitment cache, so the processed slot names the unfrozen replacement
     /// (fix in review: #16366).
+    /// R3 x C11: pubsub remembers only the slot an account was last written at
+    /// (`filter_account_result`), so a subscriber that was sent a slot's switched-out generation
+    /// never gets the replacement's write at the same slot. Open on this tree (#16357); when its
+    /// fix lands this flips, and the harness's known case goes with it.
+    #[test]
+    fn r3_switch_leaves_an_account_subscriber_on_the_switched_out_generation() {
+        let mut harness = Harness::new(tr(0) / tr(1) / tr(2));
+        let (slot, parent) = (4, 1);
+        // The version the switch goes to: complete, with one transfer. Stored first, as building
+        // it needs the slot free of a live bank.
+        let block_id_b = harness.insert_complete_alternate_version(slot, parent, 1);
+        // The first version pays for two transfers from the same funded key, so its balance at
+        // the slot differs from the second's.
+        harness.insert_block_header(slot, parent);
+        harness.insert_transfer_batch(slot, parent, FEC_SET_SHREDS);
+        harness.insert_transfer_batch(slot, parent, 2 * FEC_SET_SHREDS);
+        harness.generate_new_bank_forks();
+        assert_eq!(harness.replay(slot).unwrap(), 2);
+        harness.drain_tss();
+        harness.freeze_for_test(slot);
+        let block_id_a = harness.block_id(slot);
+        harness
+            .blockstore
+            .set_double_merkle_root(slot, BlockLocation::Original, block_id_a.to_hash())
+            .unwrap();
+        harness.notarize(slot);
+        let (findings, checks) = harness.take_pubsub_findings();
+        assert!(findings.is_empty(), "{findings:?}");
+        assert!(
+            checks > 0,
+            "the notarization sent no round the oracle compared"
+        );
+
+        harness.request_switch(slot, block_id_b);
+        harness.process_switch_bank_events();
+        assert!(harness.pending_switch.is_none(), "switch must complete");
+        harness.switch_transfer_locations(
+            slot,
+            BlockLocation::Alternate {
+                block_id: block_id_b.to_hash(),
+            },
+            block_id_a,
+        );
+        harness.generate_new_bank_forks();
+        let result = harness.replay(slot);
+        assert!(matches!(result, Ok(1)), "{result:?}");
+        harness.process_replay_result(slot, result);
+        harness.drain_tss();
+        let replacement = harness
+            .bank(slot)
+            .expect("slot recreated from the alternate");
+        assert!(
+            replacement.is_frozen(),
+            "replay finishes the complete version"
+        );
+        harness.notarize(slot);
+        let (findings, _) = harness.take_pubsub_findings();
+        let funded = harness.funded.pubkey().to_string();
+        assert!(
+            findings.iter().any(|(detail, dedupe)| *dedupe
+                && detail.starts_with(&format!("Processed subscriber to {funded}"))),
+            "the processed subscriber got the replacement's balance (#16357 landed?); update this \
+             test and retire SUBSCRIPTION_SLOT_DEDUPE: {findings:?}"
+        );
+        assert!(findings.iter().all(|(_, dedupe)| *dedupe), "{findings:?}");
+        harness.shutdown();
+    }
+
     #[test]
     fn r3_switch_bank_purges_history_but_leaves_commitment_cache_stale() {
         let mut harness = Harness::new(tr(0) / tr(1) / tr(2));
@@ -6157,16 +6750,61 @@ mod tests {
         harness.shutdown();
     }
 
-    /// Programs reach the oracles rev 13 and rev 14 added, and the startup discard (R12): the RPC
+    /// Every entry of the fuzz target's dictionary (`core/fuzz/flh_generation.dict`) decodes, in
+    /// the mode its name starts with, to exactly the ops the rest of its name lists.
+    #[test]
+    fn dictionary_entries_decode_to_their_names() {
+        fn snake(op: Op) -> String {
+            let mut name = String::new();
+            for (index, letter) in format!("{op:?}").chars().enumerate() {
+                if letter.is_ascii_uppercase() && index > 0 {
+                    name.push('_');
+                }
+                name.push(letter.to_ascii_lowercase());
+            }
+            name
+        }
+        let dictionary = include_str!("../../fuzz/flh_generation.dict");
+        let mut entries = 0;
+        for line in dictionary
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+        {
+            let (name, value) = line.split_once('=').expect("an entry is name=\"bytes\"");
+            let bytes: Vec<u8> = value
+                .trim_matches('"')
+                .split("\\x")
+                .skip(1)
+                .map(|hex| u8::from_str_radix(hex, 16).expect("bytes are \\x escapes"))
+                .collect();
+            let mut parts = name.split("__");
+            let leader = match parts.next() {
+                Some("leader") => true,
+                Some("replay") => false,
+                mode => panic!("{name}: unknown mode {mode:?}"),
+            };
+            let named: Vec<&str> = parts.collect();
+            let decoded: Vec<String> = bytes
+                .iter()
+                .map(|byte| snake(Op::from_byte(*byte, leader)))
+                .collect();
+            assert_eq!(decoded, named, "{name}");
+            entries += 1;
+        }
+        assert!(entries >= 10, "the dictionary lost its entries");
+    }
+
+    /// Programs reach the oracles rev 13 to rev 15 added, and the startup discard (R12): the RPC
     /// account reads (about half of all programs), the C5 block metadata of a rooted slot (one in
     /// seven), the C6/C7 marks of a slot replay froze (one in ten), a slot startup replay fails
-    /// and discards (about 3 in 100), and a wrong footer replay kills with nothing left
+    /// and discards (about 3 in 100), a wrong footer replay kills, the C11 subscriber comparison
+    /// (more than half) and the C11 slot-keyed dedupe (about 1 in 100), with nothing left
     /// unclassified. Re-derive the seeds whenever the generator changes.
     #[test]
     fn programs_reach_the_new_oracles_and_the_startup_discard() {
         // A seed, what it must reach, and how to tell from its report.
         type ReachCheck = (u64, &'static str, fn(&ProgramReport) -> bool);
-        let checks: [ReachCheck; 6] = [
+        let checks: [ReachCheck; 9] = [
             (84, "the RPC account oracle", |report| {
                 report.rpc_account_checks > 0
             }),
@@ -6186,6 +6824,23 @@ mod tests {
             // bank stays in bank forks and must not count as the slot's block.
             (16, "a wrong footer that replay kills", |report| {
                 report.applied.contains(&Op::CompletionWrongFooter)
+            }),
+            (2, "the C11 subscription oracle", |report| {
+                report.pubsub_checks > 0
+            }),
+            // A switch to a complete version after the first was notarized: the processed
+            // subscriber keeps the switched-out generation's balance (#16357).
+            (46, "the C11 slot-keyed dedupe", |report| {
+                report
+                    .findings
+                    .iter()
+                    .any(|finding| finding.known == Some(SUBSCRIPTION_SLOT_DEDUPE))
+            }),
+            (97, "the C11 slot-keyed dedupe", |report| {
+                report
+                    .findings
+                    .iter()
+                    .any(|finding| finding.known == Some(SUBSCRIPTION_SLOT_DEDUPE))
             }),
         ];
         for (seed, what, reached) in checks {
