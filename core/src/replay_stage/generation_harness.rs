@@ -2148,7 +2148,10 @@ impl Harness {
             }
         }
         // A validator builds its commitment cache from the forks it loaded
-        // (`validator.rs:1158-1163`), so nothing a previous run left in it survives a restart.
+        // (`validator.rs:1158-1163`), so its processed slot and root are the loaded ones. Its
+        // finalized slot starts at 0 and catches up at the next root votor sends; a program rarely
+        // gets that far, so the harness keeps the old finalized slot, which is where finality
+        // stands again once it has. The finalized oracles owe nothing above it.
         {
             let forks = self.bank_forks.read().unwrap();
             let (working, root) = (forks.working_bank().slot(), forks.root());
@@ -3353,10 +3356,23 @@ impl Harness {
     /// I3 through RPC: once TSS drained, every rooted transaction is served by each finalized
     /// signature query at its slot. `getBlock` is left to the tests: `freeze_for_test` sends
     /// no Freeze message, so the blockstore-writes watermark never reaches such slots.
+    /// Rooted transfers RPC does not serve at finalized. Only slots RPC already counts as
+    /// finalized are owed: its finalized slot is the commitment cache's, which after a restart
+    /// starts behind the root and catches up at the next root votor sends.
     fn rpc_finalized_completeness_violations(&self) -> Vec<RpcViolation> {
         let finalized = CommitmentConfig::finalized();
+        let finalized_slot = self
+            .block_commitment_cache
+            .read()
+            .unwrap()
+            .highest_super_majority_root();
         let mut violations = Vec::new();
-        for (signature, destination, slot) in self.model.rooted_transfers() {
+        for (signature, destination, slot) in self
+            .model
+            .rooted_transfers()
+            .into_iter()
+            .filter(|(_, _, slot)| *slot <= finalized_slot)
+        {
             let missing = [
                 (
                     "getSignatureStatuses",
@@ -6683,6 +6699,39 @@ mod tests {
                 .collect();
             assert!(unknown.is_empty(), "input {case:?}: {}", unknown.join("; "));
         }
+    }
+
+    /// A restart onto a ledger-only root (`LedgerRoot`, then `Restart`) leaves RPC's finalized
+    /// slot behind the root (a new validator's starts at 0; the harness keeps the old one), and a
+    /// `Root` of the same slot afterwards is stale, so votor sends no update that would catch it
+    /// up. The
+    /// finalized completeness oracle once owed that slot's history anyway; fuzzing rev 15 with its
+    /// dictionary found the input.
+    #[test]
+    fn restart_onto_a_ledger_root_input_runs_clean() {
+        let program = Program::from_bytes(&bytes_from_hex(
+            "01 00 05 0d 03 02 04 05 03 0f 08 06 05 11 17 09 0a 15 13 11 0e 03",
+        ));
+        assert!(
+            !program.leader && program.ops.contains(&Op::LedgerRoot),
+            "the input decodes differently"
+        );
+        let report = run_program_report(&program);
+        assert!(
+            report
+                .applied
+                .windows(4)
+                .any(|ops| ops == [Op::LedgerRoot, Op::Restart, Op::FlushAccounts, Op::Root]),
+            "the input no longer restarts onto the ledger root and roots after: {:?}",
+            report.applied
+        );
+        let unknown: Vec<String> = report
+            .findings
+            .iter()
+            .filter(|finding| finding.known.is_none())
+            .map(|finding| format!("[{}] {}", finding.cell, finding.detail))
+            .collect();
+        assert!(unknown.is_empty(), "{}", unknown.join("; "));
     }
 
     /// A window naming a version of the parent that replay never froze: `maybe_start_leader`
