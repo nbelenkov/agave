@@ -59,10 +59,13 @@ is the mode to replay a crash in.
 the contract for `nbelenkov/agave` at `core/fuzz/targets.toml` (the FLH fuzz
 branch keeps its contract there), so this branch carries a symlink to this one
 at that path. Seeds committed under `seeds/<cargo bin>/` are shipped as
-each target's starting corpus. For the four blockstore targets they are the 200
-smallest inputs of a minimal merge: bedlam's 20 s build smoke runs libFuzzer
+each target's starting corpus. Bedlam's 20 s build smoke runs libFuzzer
 `-fork`, whose parent executes every seed before the first job starts, and
-fails the build if no job has reported within 80 s.
+fails the build if no job has reported within 80 s. So the blockstore targets'
+seeds are the fastest inputs (timed one by one) that add up to about 12 s on a
+dev machine, minimized with `-merge=1`; check a seed refresh by running the
+target with `-fork=1 -max_total_time=20` and reading the time of the first
+`#N: cov` line.
 
 The builder pins an older nightly and keeps it on a read-only root filesystem,
 so `build.sh` installs its own nightly into `rustup/` beside the bundle when
