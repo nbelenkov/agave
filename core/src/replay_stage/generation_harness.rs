@@ -18,7 +18,9 @@
 
 use {
     super::*,
-    crate::block_creation_loop::leader_harness::LeaderSide,
+    crate::{
+        block_creation_loop::leader_harness::LeaderSide, consensus::progress_map::DeadSlotReason,
+    },
     agave_votor_messages::{
         certificate::{CertSignature, GenesisCert},
         consensus_message::{Block, BlockId},
@@ -1002,6 +1004,13 @@ impl Harness {
         // without geyser (`validator.rs:1332`), which is what this fixture is.
         let (bank_notification_sender, bank_notification_receiver) = bounded(1024);
         let votor_bank_notification_sender = bank_notification_sender.clone();
+        // Replay notifies the tracker of every bank it freezes (`replay_stage.rs:1611-1624`),
+        // through the same channel the root path uses.
+        active_banks_context.bank_notification_sender = Some(BankNotificationSenderConfig {
+            sender: bank_notification_sender.clone(),
+            should_send_parents: false,
+            dependency_tracker: Some(dependency_tracker.clone()),
+        });
         let bank_forks_context = ProcessBankForksContext {
             bank_forks: bank_forks.clone(),
             blockstore: blockstore.clone(),
@@ -1299,6 +1308,37 @@ impl Harness {
         transfer.signature
     }
 
+    /// A transfer batch whose one transfer lists an account twice, so replay rejects its entry
+    /// while validating account locks, before scheduling anything
+    /// (`InvalidTransaction(AccountLoadedTwice)`). That check is synchronous, so the pass that
+    /// reaches the batch is the one that fails, whatever the scheduler's timing; a transaction
+    /// error from execution would surface only at a later pass. The entry chains like any other.
+    /// Not a model transfer: it never executes, so no store may ever hold anything of it.
+    fn insert_failing_transfer_batch(&mut self, slot: Slot, parent_slot: Slot, fec_set_index: u32) {
+        let parent_bank = self.bank(parent_slot).unwrap();
+        let destination = self.next_pubkey();
+        let mut transaction = system_transaction::transfer(
+            &self.funded,
+            &destination,
+            1_000,
+            parent_bank.last_blockhash(),
+        );
+        transaction.message.account_keys.push(destination);
+        transaction.sign(&[&self.funded], parent_bank.last_blockhash());
+        let location = BlockLocation::Original;
+        let previous_hash = *self
+            .model
+            .last_entry_hash
+            .get(&(slot, location))
+            .unwrap_or(&parent_bank.last_blockhash());
+        let entry = entry::next_entry(&previous_hash, 1, vec![transaction]);
+        self.model
+            .last_entry_hash
+            .insert((slot, location), entry.hash);
+        let component = BlockComponent::new_entry_batch(vec![entry]).unwrap();
+        self.insert_component(slot, parent_slot, &component, fec_set_index, false);
+    }
+
     /// A transfer batch whose first data shred is withheld: the FEC set stays incomplete, so
     /// replay stops before it while a later marker is still recognised (its previous shred is
     /// the set's data-complete last shred). Returns the withheld shred; blockstore serves
@@ -1584,6 +1624,37 @@ impl Harness {
             &mut self.progress,
             &mut self.async_verification_freelist,
             &self.update_parent_receiver,
+            None,
+            Some(&self.tss_sender),
+        )
+        .unwrap();
+    }
+
+    /// Whether replay left `slot` soft-dead: failed before an UpdateParent marker, recoverable.
+    fn is_soft_dead(&self, slot: Slot) -> bool {
+        self.progress.get(&slot).is_some_and(|progress| {
+            matches!(
+                progress.dead_reason,
+                Some(
+                    DeadSlotReason::ReplayFailureBeforeUpdateParent
+                        | DeadSlotReason::ReplayFailureAtUpdateParent(_)
+                )
+            )
+        })
+    }
+
+    /// The replay loop's soft-dead pass, which runs after replay every iteration
+    /// (`replay_stage.rs`, `process_soft_dead_slots`): a soft-dead slot whose marker is now in the
+    /// blockstore restarts from it, one that completed without a marker goes hard-dead.
+    fn process_soft_dead_slots(&mut self) {
+        process_soft_dead_slots(
+            &self.my_pubkey,
+            &self.blockstore,
+            &self.bank_forks,
+            &Some(self.rpc_subscriptions.clone()),
+            &None,
+            &mut self.progress,
+            &mut self.async_verification_freelist,
             None,
             Some(&self.tss_sender),
         )
@@ -2302,11 +2373,6 @@ impl Harness {
         bank.set_block_id(Some(BlockId::new_unique()));
     }
 
-    /// `freeze_for_test` plus what replay sends once it has frozen a block: the freeze message
-    /// that tells TSS this generation is complete (`replay_stage.rs:1572-1578`). Since #15418,
-    /// RPC serves a slot's history as finalized only after TSS has seen that same generation
-    /// frozen and rooted, so a freeze TSS never hears about withholds the slot's history for
-    /// good, which no validator does.
     /// Takes over the identity that leads slot 4, as an operator's `set-identity` failover does.
     /// Replay rereads the identity every loop iteration, so from here a block for slot 4 is this
     /// node's own: replay creates its bank only once the block is full in the blockstore, and
@@ -2335,11 +2401,26 @@ impl Harness {
             .unwrap_or_default()
     }
 
+    /// `freeze_for_test` plus what replay sends once it has frozen a block: the freeze message
+    /// that tells TSS this generation is complete (`replay_stage.rs:1572-1578`), and the Frozen
+    /// bank notification for the confirmed-bank tracker (`replay_stage.rs:1611-1624`). Since
+    /// #15418, RPC serves a slot's history as finalized only after TSS has seen that same
+    /// generation frozen and rooted, so a freeze TSS never hears about withholds the slot's
+    /// history for good, which no validator does.
     fn freeze_like_replay(&mut self, slot: Slot) {
         self.freeze_for_test(slot);
         let bank = self.bank(slot).unwrap();
         self.tss_sender
             .send_transaction_status_freeze_message(&bank);
+        if let Some(sender) = self.active_banks_context.bank_notification_sender.as_ref() {
+            let work = sender
+                .dependency_tracker
+                .as_ref()
+                .map(|tracker| tracker.get_current_declared_work());
+            let _ = sender
+                .sender
+                .send((BankNotification::Frozen(bank.clone()), work));
+        }
     }
 
     /// Roots `slot` through the real votor set-root path (replay side).
@@ -3678,6 +3759,13 @@ pub enum Op {
     /// led it, and so does startup replay, which then discards the slot (R12) if the node
     /// restarted before replaying it. A slot this node led replays without the check.
     CompletionWrongFooter,
+    /// Replay mode: a prefix batch whose transfer lists an account twice, so replay rejects it
+    /// before scheduling (`InvalidTransaction`). Before an UpdateParent marker that
+    /// failure is recoverable: the slot goes soft-dead in the progress map only, and the marker
+    /// restarts it from the rooted parent, through its signal or, if that is lost, the replay
+    /// loop's soft-dead pass (`process_soft_dead_slots`, purge source `SoftDeadSlot`). A slot that
+    /// completes without a marker goes hard-dead instead.
+    FailingPrefixBatch,
 }
 
 impl Op {
@@ -3685,7 +3773,7 @@ impl Op {
     /// `Unassigned` past the table's end. **Append only.** Moving or inserting an entry changes
     /// what every stored input means, which needs a `corpus_format` bump in `targets.toml`; a new
     /// op takes the next free slot, which only changes the inputs that used that byte.
-    const REPLAY_TABLE: [Op; 28] = [
+    const REPLAY_TABLE: [Op; 29] = [
         Op::PrefixBatch,
         Op::GapBatch,
         Op::Marker,
@@ -3714,6 +3802,7 @@ impl Op {
         Op::SetIdentity,
         Op::RootLagging,
         Op::CompletionWrongFooter,
+        Op::FailingPrefixBatch,
     ];
     const REPLAY_SLOTS: usize = 32;
 
@@ -4015,6 +4104,17 @@ impl Program {
                 ],
             );
         }
+        // A prefix replay fails before the marker (`Op::FailingPrefixBatch`). The prefix replays
+        // once on its own first, so its generation is recorded; the failure then leaves the slot
+        // soft-dead until the marker restarts it.
+        if rng.random_bool(0.2)
+            && let Some(last_prefix) = ops.iter().rposition(|op| *op == Op::PrefixBatch)
+        {
+            ops.splice(
+                last_prefix + 1..last_prefix + 1,
+                [Op::Replay, Op::FailingPrefixBatch, Op::Replay],
+            );
+        }
         ops.truncate(Self::MAX_OPS);
         Self {
             label: seed,
@@ -4180,6 +4280,10 @@ struct ProgramRun<'a> {
     slot_mark_checks: usize,
     /// Subscribers the C11 oracle compared with their bank after a notification round.
     pubsub_checks: usize,
+    /// Replay passes that left the slot soft-dead, and soft-dead slots the replay loop's
+    /// soft-dead pass restarted from their marker.
+    soft_dead_slots: usize,
+    soft_dead_restarts: usize,
     startup_discards: usize,
     #[cfg(test)]
     applied: Vec<Op>,
@@ -4215,6 +4319,16 @@ impl ProgramRun<'_> {
 
     fn bank(&self) -> Option<Arc<Bank>> {
         self.harness.bank(Self::SLOT)
+    }
+
+    /// The replay loop's soft-dead pass after a replay step, counting a soft-dead slot it
+    /// restarted from its marker.
+    fn soft_dead_pass(&mut self, slot: Slot) {
+        let was_soft_dead = self.harness.is_soft_dead(slot);
+        self.harness.process_soft_dead_slots();
+        if was_soft_dead && self.bank().is_none() {
+            self.soft_dead_restarts += 1;
+        }
     }
 
     /// The slot's bank once it froze into a usable block. A bank replay froze and then failed
@@ -4268,6 +4382,15 @@ impl ProgramRun<'_> {
                 }
                 self.harness
                     .insert_transfer_batch(slot, optimistic, self.next_shred_index);
+                self.next_shred_index += FEC_SET_SHREDS;
+                self.prefix_batches += 1;
+            }
+            Op::FailingPrefixBatch => {
+                if !prefix_open || self.withheld.is_some() || self.prefix_batches >= 3 {
+                    return false;
+                }
+                self.harness
+                    .insert_failing_transfer_batch(slot, optimistic, self.next_shred_index);
                 self.next_shred_index += FEC_SET_SHREDS;
                 self.prefix_batches += 1;
             }
@@ -4339,6 +4462,13 @@ impl ProgramRun<'_> {
                 let Some(bank) = self.bank().filter(|bank| !bank.is_frozen()) else {
                     return false;
                 };
+                // Replay skips a dead slot (`replay_active_banks`); the loop's soft-dead pass that
+                // follows is what revisits a soft-dead one.
+                if self.harness.is_soft_dead(slot) {
+                    drop(bank);
+                    self.soft_dead_pass(slot);
+                    return true;
+                }
                 // An alternate version the switch brought in without a stored complete one has no
                 // footer in this fixture, so replaying it would only kill the slot; it is frozen
                 // directly instead. A complete version replays like any block.
@@ -4375,10 +4505,15 @@ impl ProgramRun<'_> {
                     | Err(BlockstoreProcessorError::FailedToLoadEntries(
                         BlockstoreError::DeadSlot,
                     ))
-                    | Err(BlockstoreProcessorError::InvalidBlock(_)) => {}
+                    | Err(BlockstoreProcessorError::InvalidBlock(_))
+                    | Err(BlockstoreProcessorError::InvalidTransaction(_)) => {}
                     Err(err) => panic!("unexpected replay error ({}): {err:?}", self.label()),
                 }
                 self.harness.process_replay_result(slot, result);
+                if self.harness.is_soft_dead(slot) {
+                    self.soft_dead_slots += 1;
+                }
+                self.soft_dead_pass(slot);
                 if let Some(bank) = self.frozen_bank() {
                     // A real completion froze the bank; the block id votor would attach with
                     // the certificate is assigned here.
@@ -5550,6 +5685,10 @@ impl ProgramRun<'_> {
             #[cfg(test)]
             pubsub_checks: self.pubsub_checks,
             #[cfg(test)]
+            soft_dead_slots: self.soft_dead_slots,
+            #[cfg(test)]
+            soft_dead_restarts: self.soft_dead_restarts,
+            #[cfg(test)]
             startup_discards: self.startup_discards,
             #[cfg(test)]
             skipped: self.skipped,
@@ -5579,6 +5718,10 @@ struct ProgramReport {
     slot_mark_checks: usize,
     #[cfg(test)]
     pubsub_checks: usize,
+    #[cfg(test)]
+    soft_dead_slots: usize,
+    #[cfg(test)]
+    soft_dead_restarts: usize,
     #[cfg(test)]
     startup_discards: usize,
     #[cfg(test)]
@@ -5643,6 +5786,8 @@ fn run_program_report(program: &Program) -> ProgramReport {
         block_meta_checks: 0,
         slot_mark_checks: 0,
         pubsub_checks: 0,
+        soft_dead_slots: 0,
+        soft_dead_restarts: 0,
         startup_discards: 0,
         #[cfg(test)]
         applied: Vec::new(),
@@ -5899,6 +6044,107 @@ mod tests {
     /// switch purges the old version's history synchronously and clears the in-memory stores, but
     /// nothing re-tags the commitment cache, so the processed slot names the unfrozen replacement
     /// (fix in review: #16366).
+    /// Replay tells the confirmed-bank tracker about every bank it freezes
+    /// (`replay_stage.rs:1611-1624`), so a confirmation that arrived before the freeze is
+    /// delivered by it. The harness wires replay's sender to the tracker's channel as a validator
+    /// does.
+    #[test]
+    fn replay_freezes_reach_the_confirmed_bank_tracker() {
+        let mut harness = Harness::new(tr(0) / tr(1) / tr(2));
+        let (slot, parent) = (4, 1);
+        harness.insert_block_header(slot, parent);
+        let completion = harness.build_completion(slot, parent, 1, BlockLocation::Original);
+        harness.insert_completion(
+            slot,
+            parent,
+            &completion,
+            FEC_SET_SHREDS,
+            BlockLocation::Original,
+        );
+        harness.generate_new_bank_forks();
+        let result = harness.replay(slot);
+        harness.process_replay_result(slot, result);
+        assert!(
+            harness.bank(slot).unwrap().is_frozen(),
+            "replay did not freeze the block"
+        );
+        let frozen: Vec<Slot> = harness
+            .bank_notification_receiver
+            .try_iter()
+            .filter_map(|(notification, _)| match notification {
+                BankNotification::Frozen(bank) => Some(bank.slot()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            frozen,
+            vec![slot],
+            "replay's freeze never reached the tracker"
+        );
+        harness.shutdown();
+    }
+
+    /// A prefix that replay fails before the marker leaves the slot soft-dead: the progress map
+    /// only, nothing in the blockstore. When the marker arrives and its signal is lost, the
+    /// replay loop's soft-dead pass restarts the slot from it (`process_soft_dead_slots`, purge
+    /// source `SoftDeadSlot`), which must purge the prefix's history like the signal path does.
+    #[test]
+    fn a_failed_prefix_restarts_from_the_marker_through_the_soft_dead_pass() {
+        let mut harness = Harness::new(tr(0) / tr(1) / tr(2));
+        let slot = 4;
+        let optimistic_parent = 2;
+        let rooted_parent = 1;
+
+        harness.insert_block_header(slot, optimistic_parent);
+        let prefix = harness.insert_transfer_batch(slot, optimistic_parent, FEC_SET_SHREDS);
+        harness.generate_new_bank_forks();
+        assert_eq!(harness.replay(slot).unwrap(), 1);
+        harness.drain_tss();
+        let row = |harness: &Harness| {
+            harness
+                .blockstore
+                .read_transaction_status((prefix, slot))
+                .unwrap()
+                .is_some()
+        };
+        assert!(row(&harness), "TSS must have written the prefix row");
+
+        harness.insert_failing_transfer_batch(slot, optimistic_parent, 2 * FEC_SET_SHREDS);
+        let result = harness.replay(slot);
+        assert!(
+            matches!(result, Err(BlockstoreProcessorError::InvalidTransaction(_))),
+            "{result:?}"
+        );
+        harness.process_replay_result(slot, result);
+        assert!(
+            harness.is_soft_dead(slot),
+            "the failure did not leave the slot soft-dead"
+        );
+        assert!(
+            !harness.blockstore.is_dead(slot),
+            "a soft-dead slot must not be marked dead in the blockstore"
+        );
+
+        harness.insert_update_parent(slot, optimistic_parent, rooted_parent, 3 * FEC_SET_SHREDS);
+        while harness.update_parent_receiver.try_recv().is_ok() {}
+        harness.process_soft_dead_slots();
+        assert!(
+            harness.bank(slot).is_none(),
+            "the soft-dead pass did not restart the slot from its marker"
+        );
+        harness.drain_tss();
+        assert!(
+            !row(&harness),
+            "the soft-dead restart must purge the failed prefix's history"
+        );
+        harness.generate_new_bank_forks();
+        let recreated = harness
+            .bank(slot)
+            .expect("the slot is recreated from the marker");
+        assert_eq!(recreated.parent_slot(), rooted_parent);
+        harness.shutdown();
+    }
+
     /// R3 x C11: pubsub remembers only the slot an account was last written at
     /// (`filter_account_result`), so a subscriber that was sent a slot's switched-out generation
     /// never gets the replacement's write at the same slot. Open on this tree (#16357); when its
@@ -6847,13 +7093,14 @@ mod tests {
     /// account reads (about half of all programs), the C5 block metadata of a rooted slot (one in
     /// seven), the C6/C7 marks of a slot replay froze (one in ten), a slot startup replay fails
     /// and discards (about 3 in 100), a wrong footer replay kills, the C11 subscriber comparison
-    /// (more than half) and the C11 slot-keyed dedupe (about 1 in 100), with nothing left
-    /// unclassified. Re-derive the seeds whenever the generator changes.
+    /// (more than half), the C11 slot-keyed dedupe (about 1 in 100), and soft-dead slots and
+    /// their restart by the replay loop's soft-dead pass, with nothing left unclassified.
+    /// Re-derive the seeds whenever the generator changes.
     #[test]
     fn programs_reach_the_new_oracles_and_the_startup_discard() {
         // A seed, what it must reach, and how to tell from its report.
         type ReachCheck = (u64, &'static str, fn(&ProgramReport) -> bool);
-        let checks: [ReachCheck; 9] = [
+        let checks: [ReachCheck; 11] = [
             (84, "the RPC account oracle", |report| {
                 report.rpc_account_checks > 0
             }),
@@ -6890,6 +7137,12 @@ mod tests {
                     .findings
                     .iter()
                     .any(|finding| finding.known == Some(SUBSCRIPTION_SLOT_DEDUPE))
+            }),
+            // A prefix replay fails before the marker (about 1 program in 7), and the replay
+            // loop's soft-dead pass restarts a slot whose marker's signal was lost (1 in 70).
+            (4, "a soft-dead slot", |report| report.soft_dead_slots > 0),
+            (229, "a restart by the soft-dead pass", |report| {
+                report.soft_dead_restarts > 0
             }),
         ];
         for (seed, what, reached) in checks {

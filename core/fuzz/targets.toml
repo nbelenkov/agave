@@ -36,7 +36,8 @@ dictionary   = "out/dict/agave-flh-generation.dict"
 # The coverage figure counts only the code the discard paths run through, matched as path
 # substrings. Unscoped, every line linked into the binary counts, and the figure hides where
 # programs stop reaching. The harness itself (replay_stage/generation_harness.rs,
-# block_creation_loop/leader_harness.rs) is left out on purpose.
+# block_creation_loop/leader_harness.rs) is left out on purpose. Most of rpc.rs is RPC methods no
+# program calls, a constant the figure carries; the reads the oracles make are in it.
 coverage_paths = [
   "core/src/replay_stage.rs",
   "core/src/replay_stage/update_parent.rs",
@@ -48,6 +49,8 @@ coverage_paths = [
   "rpc/src/transaction_status_service.rs",
   "rpc/src/optimistically_confirmed_bank_tracker.rs",
   "rpc/src/rpc.rs",
+  "rpc/src/rpc_subscriptions.rs",
+  "core/src/commitment_service.rs",
   "runtime/src/bank_forks.rs",
   "accounts-db/src/accounts_cache.rs",
   "votor/src/root_utils.rs",

@@ -40,3 +40,7 @@ leader__leader_next_slot__leader_record__leader_complete="\x20\x1a\x1d"
 leader__leader_start__leader_record__window_certified_past="\x19\x1a\x21"
 # a completed slot broadcast and replayed
 leader__leader_complete__broadcast__handle_interrupts__replay="\x1d\x1f\x03\x05"
+# a prefix replayed, then a batch that fails it: the slot goes soft-dead
+replay__replay__failing_prefix_batch__replay="\x05\x1c\x05"
+# the marker whose signal is lost, so the soft-dead pass restarts the slot
+replay__marker__drop_signal__replay="\x02\x04\x05"
